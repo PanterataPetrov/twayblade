@@ -381,3 +381,9 @@ docs/               Architecture and compatibility evidence
 - https://github.com/longbridge/gpui-kit
 - https://github.com/element-hq/element-call
 - https://github.com/livekit/rust-sdks
+
+### Scheme-specific accents (2026-11-14)
+
+- OS accent and saved accent overrides now apply only to System. Solarized uses its blue, Gruvbox its light/dark blue, Nord its frost blue, and Catppuccin its Latte/Mocha mauve. Light/Dark/High Contrast use fixed blue; Custom uses the Catppuccin base accent because its editable palette has no accent field. Saved overrides are retained for switching back to System.
+- Existing foreground, link contrast and high-contrast adjustments remain applied to the chosen accent. No view layout or Settings controls changed.
+- Added regression coverage for override isolation across all schemes and variants, plus foreground/link contrast. `git diff --check` passed. Rust formatting, Clippy, tests and compilation were not run: the required pinned Nix shell is unavailable on this machine. Live appearance and physical platform acceptance remain unverified; the running bundle has not been rebuilt.

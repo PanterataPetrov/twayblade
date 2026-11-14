@@ -235,6 +235,33 @@ pub(super) fn accent_bytes(color: Hsla) -> [u8; 3] {
     let value: Rgba = color.into();
     [value.r, value.g, value.b].map(|v| (v.clamp(0., 1.) * 255.).round() as u8)
 }
+/// Named schemes own their accent; OS and saved accent overrides belong only
+/// to System. Custom has no accent field, so use its Catppuccin base accent.
+fn scheme_accent(
+    scheme: Scheme,
+    dark: bool,
+    system: Option<[f32; 3]>,
+    saved: Option<[u8; 3]>,
+) -> Rgba {
+    if scheme == Scheme::System
+        && let Some([r, g, b]) = saved
+            .map(|value| value.map(|v| f32::from(v) / 255.))
+            .or(system)
+    {
+        return Rgba { r, g, b, a: 1. };
+    }
+    rgb(match (scheme, dark) {
+        (Scheme::Solarized, _) => 0x268bd2,
+        (Scheme::Gruvbox, true) => 0x83a598,
+        (Scheme::Gruvbox, false) => 0x076678,
+        (Scheme::Nord, _) => 0x88c0d0,
+        (Scheme::Catppuccin | Scheme::Custom, true) => 0xcba6f7,
+        (Scheme::Catppuccin | Scheme::Custom, false) => 0x8839ef,
+        (_, true) => 0x0070df,
+        (_, false) => 0x0064d2,
+    })
+}
+
 fn effective_accent(accent: Rgba, high_contrast: bool) -> Rgba {
     if !high_contrast {
         return accent;
@@ -321,20 +348,7 @@ pub(super) fn apply(cx: &mut App) {
         theme.radius = px(8.);
         theme.radius_lg = px(14.);
         let colors = &mut theme.colors;
-        let custom = preferences
-            .accent
-            .map(|value| value.map(|v| f32::from(v) / 255.));
-        let accent: Rgba = custom
-            .or(system)
-            .map(|[r, g, b]| Rgba { r, g, b, a: 1. })
-            .unwrap_or_else(|| {
-                rgb(match (preferences.scheme, dark) {
-                    (Scheme::Catppuccin, true) => 0xcba6f7,
-                    (Scheme::Catppuccin, false) => 0x8839ef,
-                    _ if dark => 0x0070df,
-                    _ => 0x0064d2,
-                })
-            });
+        let accent = scheme_accent(preferences.scheme, dark, system, preferences.accent);
         let accent = effective_accent(accent, preferences.scheme == Scheme::HighContrast);
         let primary: Hsla = accent.into();
         let on_primary = foreground(accent);
@@ -606,6 +620,43 @@ mod tests {
         assert!(contrast(readable_accent(navy, black, true), black) >= 4.5);
         // An already readable accent is left unchanged.
         assert!(readable_accent(navy, white, false) == navy);
+    }
+
+    #[test]
+    fn accent_overrides_apply_only_to_system() {
+        let system = Some([1., 0., 0.]);
+        let saved = Some([0, 255, 0]);
+        for dark in [false, true] {
+            assert_eq!(
+                hex(scheme_accent(Scheme::System, dark, system, None)),
+                0xff0000
+            );
+            assert_eq!(
+                hex(scheme_accent(Scheme::System, dark, system, saved)),
+                0x00ff00
+            );
+            for scheme in Scheme::ALL {
+                if scheme == Scheme::System {
+                    continue;
+                }
+                let accent = scheme_accent(scheme, dark, system, saved);
+                assert_eq!(accent, scheme_accent(scheme, dark, None, None));
+                let accent = effective_accent(accent, scheme == Scheme::HighContrast);
+                let minimum = if scheme == Scheme::HighContrast {
+                    7.
+                } else {
+                    4.5
+                };
+                assert!(contrast(accent, foreground(accent).into()) >= minimum);
+                let background = rgb(surfaces(scheme, dark)[0]);
+                assert!(
+                    contrast(
+                        readable_accent_to(accent, background, dark, minimum),
+                        background,
+                    ) >= minimum
+                );
+            }
+        }
     }
 
     #[test]
