@@ -19,6 +19,8 @@ pub(crate) enum Control {
     Output(String),
     Camera(String),
     Screen(bool),
+    ScreenSources(twayblade_core::calls::SourceKind),
+    ShareScreen(CallTicket, twayblade_core::calls::ScreenSelection),
     Leave,
 }
 impl State {
@@ -38,6 +40,45 @@ impl State {
     }
 }
 impl Backend {
+    /// Source listing is read-only. Capture the returned ticket with the menu;
+    /// use it for the eventual Share action, not a newly fetched call identity.
+    pub(crate) fn request_screen_sources(
+        &self,
+        expected: u128,
+        kind: twayblade_core::calls::SourceKind,
+    ) -> Result<CallTicket, CallError> {
+        let state = self.state.lock().map_err(|_| CallError::StaleRequest)?;
+        if state.account.as_ref().map(Account::instance_id) != Some(expected) {
+            return Err(CallError::StaleRequest);
+        }
+        let ticket = CallTicket {
+            account: expected,
+            request: state.call_request,
+        };
+        state
+            .call_control
+            .as_ref()
+            .ok_or(CallError::ControlUnavailable)?
+            .try_send(Control::ScreenSources(kind))
+            .map_err(|_| CallError::ControlUnavailable)?;
+        Ok(ticket)
+    }
+    pub(crate) fn share_screen_source(
+        &self,
+        ticket: CallTicket,
+        selection: twayblade_core::calls::ScreenSelection,
+    ) -> Result<(), CallError> {
+        let state = self.state.lock().map_err(|_| CallError::StaleRequest)?;
+        if !state.accepts_call(ticket) {
+            return Err(CallError::StaleRequest);
+        }
+        state
+            .call_control
+            .as_ref()
+            .ok_or(CallError::ControlUnavailable)?
+            .try_send(Control::ShareScreen(ticket, selection))
+            .map_err(|_| CallError::ControlUnavailable)
+    }
     pub(crate) fn call_video_handle(
         &self,
         expected: u128,
@@ -163,6 +204,7 @@ impl Backend {
             if let Some(call) = &mut v.call {
                 call.participants.clear();
                 call.phase = CallPhase::Ended(EndReason::Left);
+                call.screen_sources.clear();
             }
         });
         Ok(())
@@ -210,6 +252,8 @@ fn launch_call(
     publish(updates, |v| {
         v.call = Some(CallState {
             ticket: Some(ticket),
+            screen_backend: None,
+            screen_sources: Vec::new(),
             events: Vec::new(),
             local: Default::default(),
             devices: Default::default(),
@@ -253,6 +297,7 @@ fn launch_call(
                 });
                 call.error = result.err();
                 call.participants.clear();
+                call.screen_sources.clear();
             }
         });
     }));
@@ -297,6 +342,7 @@ pub(super) fn observe(backend: &Backend, state: &mut State, account: Account) {
                 {
                     call.participants.clear();
                     call.phase = CallPhase::Ended(EndReason::RoomLeft);
+                    call.screen_sources.clear();
                 }
                 v.room_calls = activity.room_calls;
                 v.incoming_calls = activity.incoming_calls;
@@ -374,6 +420,11 @@ async fn run(
                     Some(Control::Output(id))=>NativeControl::Output(id),
                     Some(Control::Camera(id))=>NativeControl::Camera(id),
                     Some(Control::Screen(v))=>NativeControl::Screen(v),
+                    Some(Control::ScreenSources(kind))=>NativeControl::ScreenSources(kind),
+                    Some(Control::ShareScreen(expected,selection))=>{
+                        if expected != ticket {continue;}
+                        NativeControl::ShareScreen(selection)
+                    },
                     _=>{call.leave().await?;return Ok(EndReason::Left);}
                 };
                 call.control(control)?;
@@ -538,7 +589,7 @@ mod tests {
     use super::*;
     #[test]
     fn stale_playback_commands_and_snapshots_are_rejected_after_leave() {
-        let backend = Backend::new().unwrap();
+        let backend = Backend::with_lock(None).unwrap();
         let ticket = CallTicket {
             account: 5,
             request: 0,
@@ -560,6 +611,31 @@ mod tests {
             update(&backend.state, &backend.updates, ticket, |_| panic!(
                 "stale projection"
             )),
+            Err(CallError::StaleRequest)
+        );
+    }
+    #[test]
+    fn screen_choices_cannot_capture_after_account_or_call_teardown() {
+        let backend = Backend::with_lock(None).unwrap();
+        let ticket = CallTicket {
+            account: 5,
+            request: 0,
+        };
+        let choice = twayblade_core::calls::ScreenSelection {
+            kind: twayblade_core::calls::SourceKind::Screen,
+            id: 42,
+        };
+        assert_eq!(
+            backend.request_screen_sources(5, choice.kind),
+            Err(CallError::StaleRequest)
+        );
+        assert_eq!(
+            backend.share_screen_source(ticket, choice),
+            Err(CallError::StaleRequest)
+        );
+        backend.state.lock().unwrap().cancel_call();
+        assert_eq!(
+            backend.share_screen_source(ticket, choice),
             Err(CallError::StaleRequest)
         );
     }

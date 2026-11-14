@@ -109,7 +109,7 @@ async fn native_matrixrtc_audio_and_video() {
         "two memberships, participant lists, bidirectional keys and decrypted audio",
     );
     verify_playback_controls(&call_a, &call_b, &accounts).await;
-    verify_livekit_pair(
+    verify_livekit_participants(
         accounts
             .iter()
             .map(|a| format!("{}:{}", a.user_id(), a.client.device_id().unwrap()))
@@ -184,7 +184,7 @@ async fn native_matrixrtc_audio_and_video() {
             for call in [&call_a,&call_b]{assert!(!matches!(call.updates.borrow().phase,CallPhase::Ended(_)),"membership/media refresh must preserve the call");assert_eq!(call.updates.borrow().participants.len(),2);}
         }
     }).await,"sustained call across expiry refresh and delayed-event renewal");
-    verify_livekit_pair(
+    verify_livekit_participants(
         accounts
             .iter()
             .map(|a| format!("{}:{}", a.user_id(), a.client.device_id().unwrap()))
@@ -340,7 +340,15 @@ async fn native_matrixrtc_audio_and_video() {
     checked(call_b.leave().await, "Bob leave");
 }
 
+#[path = "group_integration.rs"]
+mod group;
+
 async fn fixture_pair() -> (Vec<Account>, Tasks, matrix_sdk::Room, serde_json::Value) {
+    fixture_accounts(&["alice", "bob"]).await
+}
+async fn fixture_accounts(
+    roles: &[&str],
+) -> (Vec<Account>, Tasks, matrix_sdk::Room, serde_json::Value) {
     let root =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-data/local/integration");
     let fixture: serde_json::Value = checked(
@@ -356,7 +364,7 @@ async fn fixture_pair() -> (Vec<Account>, Tasks, matrix_sdk::Room, serde_json::V
         "certificate",
     );
     let mut accounts = Vec::new();
-    for role in ["alice", "bob"] {
+    for role in roles {
         let path = root.join(format!("call-{}", uuid::Uuid::new_v4()));
         let client = checked(
             Client::builder()
@@ -409,9 +417,11 @@ async fn fixture_pair() -> (Vec<Account>, Tasks, matrix_sdk::Room, serde_json::V
         )
         .unwrap(),
     );
-    request
-        .invite
-        .push(accounts[1].client.user_id().unwrap().to_owned());
+    request.invite.extend(
+        accounts[1..]
+            .iter()
+            .map(|a| a.client.user_id().unwrap().to_owned()),
+    );
     request.initial_state.push(
         checked(
             Raw::new(&InitialStateEvent::with_empty_state_key(
@@ -425,10 +435,12 @@ async fn fixture_pair() -> (Vec<Account>, Tasks, matrix_sdk::Room, serde_json::V
         accounts[0].client.create_room(request).await,
         "encrypted room",
     );
-    checked(
-        accounts[1].client.join_room_by_id(room.room_id()).await,
-        "join room",
-    );
+    for account in &accounts[1..] {
+        checked(
+            account.client.join_room_by_id(room.room_id()).await,
+            "join room",
+        );
+    }
     checked(
         timeout(Duration::from_secs(30), async {
             while !accounts
@@ -602,7 +614,7 @@ async fn native_matrixrtc_element_audio_and_video() {
         audio_result,
         "Element/native bidirectional decrypted audio, key exchange and participants",
     );
-    verify_livekit_pair(vec![
+    verify_livekit_participants(vec![
         format!(
             "{}:{}",
             accounts[0].user_id(),
@@ -639,7 +651,7 @@ async fn native_matrixrtc_element_audio_and_video() {
     .expect("browser wait");
 }
 
-async fn verify_livekit_pair(identities: Vec<String>) {
+async fn verify_livekit_participants(identities: Vec<String>) {
     use tokio::io::AsyncWriteExt;
     let mut child = checked(
         tokio::process::Command::new("python3")
@@ -665,13 +677,13 @@ async fn verify_livekit_pair(identities: Vec<String>) {
     let output = checked(child.wait_with_output().await, "LiveKit server evidence");
     assert!(
         output.status.success(),
-        "LiveKit server must contain exactly both expected participants"
+        "LiveKit server must contain exactly the expected participants"
     );
     let counts: serde_json::Value = checked(
         serde_json::from_slice(&output.stdout),
         "LiveKit evidence counts",
     );
-    assert_eq!(counts["livekit_participants"], 2);
+    assert_eq!(counts["livekit_participants"], identities.len());
 }
 
 #[tokio::test]
