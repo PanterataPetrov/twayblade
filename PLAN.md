@@ -817,3 +817,11 @@ docs/               Architecture and compatibility evidence
 - https://github.com/longbridge/gpui-kit
 - https://github.com/element-hq/element-call
 - https://github.com/livekit/rust-sdks
+
+### Selected app icon source (2026-11-14)
+
+- Saved the user-selected orange console flower on charcoal as `assets/twayblade-icon-source.png`. This is the original raster concept, including its white outer margin.
+- Generated `assets/Twayblade.icns` with PNG representations at 16, 32, 64, 128, 256, 512 and 1024 px. The macOS build copies it into Resources and Info.plist declares it as the bundle icon. Original source artwork is retained unchanged.
+- Verification: PNG dimensions/signatures, ICNS file recognition, Bash syntax, plist lint and existing-bundle code-signature verification passed. Updated and restarted the existing debug bundle without recompiling Rust. Actual Dock appearance is awaiting operator confirmation; Linux/Windows icon packaging remains pending.
+- Follow-up: rebuilt the debug app with the installed Cargo toolchain (two jobs; 5.45 s), verified the signed bundle and matching icon resource, and decoded the ICNS successfully with macOS `sips`. Refreshed LaunchServices registration and restarted online. This is a local non-Nix compile/package check, not pinned-shell or physical Dock acceptance.
+- Removed the white outer background in `assets/twayblade-icon-transparent.png` while retaining the original concept. Regenerated the seven-size ICNS and updated the existing bundle. Verified source alpha and bundle code signature, refreshed LaunchServices registration and restarted online. Physical Dock appearance awaits operator confirmation.
