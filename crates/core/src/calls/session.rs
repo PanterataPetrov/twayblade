@@ -470,6 +470,8 @@ impl NativeCall {
                         }).unwrap_or_default();
                         let _ = response.send(gains);
                     }
+                    #[cfg(test)]
+                    Some(DriverCommand::KeyIndex(response)) => { let _ = response.send(self.keys.index); }
                     Some(DriverCommand::Control(NativeControl::Leave)) | None => {
                         self.leave().await?;
                     }
@@ -889,6 +891,8 @@ pub struct CallHandle {
 enum DriverCommand {
     #[cfg(test)]
     Playback(String, tokio::sync::oneshot::Sender<Vec<f64>>),
+    #[cfg(test)]
+    KeyIndex(tokio::sync::oneshot::Sender<u8>),
     Control(NativeControl),
     /// Fixture media: a generated camera, or a generated screen share.
     #[cfg(test)]
@@ -938,6 +942,15 @@ impl CallHandle {
         let (send, receive) = tokio::sync::oneshot::channel();
         self.commands
             .send(DriverCommand::Playback(id.into(), send))
+            .await
+            .unwrap();
+        receive.await.unwrap()
+    }
+    #[cfg(test)]
+    pub(crate) async fn sender_key_index(&self) -> u8 {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(DriverCommand::KeyIndex(send))
             .await
             .unwrap();
         receive.await.unwrap()
