@@ -348,8 +348,9 @@ Integration base (2026-11-14):
   acceptance.
 - Nix: fresh `nix flake show --no-eval-cache --all-systems --json` passed for
   Apple Silicon macOS and x86_64/aarch64 Linux on the combined source. The
-  original #28 Apple Silicon package build remains historical evidence; the
-  combined package has not been rebuilt or physically accepted.
+  original #28 Apple Silicon package build remains historical evidence. The
+  combined source's `nix build .#default` also built on Apple Silicon macOS
+  (2026-11-14, 7 min, `twayblade-0.1.0`); it was not launched or physically accepted.
 - GitHub project Board rendering and date-field configuration remain unverified;
   this session could not open the user's Chrome. No roadmap dates were invented.
 - No remote publication or PR merge was performed by this integration work.
