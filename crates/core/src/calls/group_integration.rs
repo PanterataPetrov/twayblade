@@ -103,7 +103,7 @@ async fn scenario() {
     assert_ne!(ready["user_id"], accounts[0].user_id().as_str());
     assert_ne!(ready["user_id"], accounts[1].user_id().as_str());
     let mut browser = serde_json::Value::Null;
-    checked(timeout(Duration::from_secs(45), async {
+    let initial = timeout(Duration::from_secs(45), async {
         loop {
             tokio::select! {
                 result = a.updates.changed() => checked(result, "initial native membership"),
@@ -114,7 +114,23 @@ async fn scenario() {
             }
             if members_count(&a) == 2 && frames(&a) > 20 && count(&browser,"audio") > 20 && browser["participants"] == 2 { break; }
         }
-    }).await, "native and Element establish an encrypted call before the third joins");
+    }).await;
+    if initial.is_err() {
+        eprintln!(
+            "Group initial counts: native_participants={}, native_keys={}, native_audio={}, browser_participants={}, browser_keys={}, browser_audio={}, browser_audio_tracks={}",
+            members_count(&a),
+            a.keys_received(),
+            frames(&a),
+            count(&browser, "participants"),
+            count(&browser, "keys"),
+            count(&browser, "audio"),
+            count(&browser, "audioTracks"),
+        );
+    }
+    checked(
+        initial,
+        "native and Element establish an encrypted call before the third joins",
+    );
     let mut b = tone(&accounts[1], room.room_id().as_str(), &mut tasks).await;
     let audio_before_join = frames(&a);
     let browser_keys_before_join = count(&browser, "keys");

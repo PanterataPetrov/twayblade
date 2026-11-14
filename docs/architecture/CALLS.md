@@ -465,7 +465,9 @@ mandatory LiveKit frame E2EE and latest-frame handles. Screen failure stops the
 share, not the encrypted call. Message E2EE and media E2EE remain distinct gates.
 
 Verification: macOS fmt, strict Clippy and 203 offline tests passed; isolated
-generated-media call regressions passed 3/3. Linux/Windows CI is pending. Physical XDG portal consent and
+generated-media call regressions passed 3/3. Hosted macOS/Linux/Windows checks
+passed on PR #29 at `dbc0a2a`; these cover compilation and offline tests.
+Physical XDG portal consent and
 cancellation, X11/WGC source capture, actual selected Windows backend, desktop
 lock/stop, multiple monitors, default-device mapping, playback and hot-plug on
 Linux/Windows remain unverified. The source-picker view is not built yet. No physical or milestone acceptance is claimed.

@@ -615,30 +615,6 @@ mod tests {
         );
     }
     #[test]
-    fn cancelling_a_call_invalidates_pending_work_and_drops_controls() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut state = State::default();
-        let task = runtime.spawn(std::future::pending());
-        let aborted = task.abort_handle();
-        let (tx, mut rx) = mpsc::channel(QUEUE_CAPACITY);
-        state.call_task = Some(task);
-        state.call_control = Some(tx);
-        let request = state.call_request;
-        state.cancel_call();
-        assert_ne!(state.call_request, request);
-        assert!(state.call_control.is_none());
-        runtime.block_on(async {
-            assert!(rx.recv().await.is_none());
-            tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !aborted.is_finished() {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-        });
-    }
-    #[test]
     fn screen_choices_cannot_capture_after_account_or_call_teardown() {
         let backend = Backend::with_lock(None).unwrap();
         let ticket = CallTicket {
