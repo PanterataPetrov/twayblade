@@ -2483,6 +2483,27 @@ fn call_full_screen_shows_only_the_call(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn offline_banner_shows_only_without_a_connection(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestQueryExt;
+    let (window, app) = preview_window(cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find_all("offline-banner").is_empty());
+    })
+    .expect("online");
+    cx.update(|cx| app.update(cx, |app, _| app.preview_offline()));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .find_by_label("No internet connection. Showing saved messages.")
+                .visible()
+        );
+    })
+    .expect("offline");
+}
+
+#[gpui_kit::test]
 fn screen_picker_lists_sources_and_opens_from_the_share_button(cx: &mut TestAppContext) {
     use twayblade_core::calls::SourceKind;
     let (window, app) = preview_window(cx);
