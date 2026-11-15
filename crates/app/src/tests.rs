@@ -2648,6 +2648,11 @@ fn archive_moves_a_room_out_of_its_section_and_lists_it_from_home(cx: &mut TestA
         // listing a room that lives in a space.
         app.update(cx, |app, cx| app.show_archive(window, cx));
         window.render_frame(cx);
+        let row = app.update(cx, |app, cx| app.room_focus("announcements", cx));
+        assert!(
+            row.is_focused(window),
+            "keyboard focus lands on the first archived room"
+        );
         let app_state = app.read(cx);
         assert!(app_state.navigation.selected_space.is_none());
         assert!(!app_state.collapsed_sections.contains("archive"));
@@ -2693,6 +2698,249 @@ fn invite_contact_copies_a_matrix_to_link(cx: &mut TestAppContext) {
         assert!(app.read(cx).management.as_ref().expect("dialog").copied);
     })
     .expect("copy the contact link");
+}
+
+fn two_accounts(app: &mut MatrixApp) {
+    let me = app.snapshot.user_id.clone();
+    app.snapshot.accounts = vec![
+        crate::backend::AccountEntry {
+            id: "one".into(),
+            user_id: me,
+            homeserver: "https://matrix.example.org/".into(),
+            active: true,
+            ..Default::default()
+        },
+        crate::backend::AccountEntry {
+            id: "two".into(),
+            user_id: "@sam:example.com".into(),
+            homeserver: "https://example.com/".into(),
+            active: false,
+            ..Default::default()
+        },
+    ];
+}
+
+#[gpui_kit::test]
+fn add_account_sheet_keeps_the_workspace_and_cancels_with_escape(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
+    let (window, app) = preview_window(cx);
+    cx.update(|cx| cx.bind_keys(crate::shortcuts::bindings()));
+    let user = cx.update(|cx| app.read(cx).snapshot.user_id.clone());
+    cx.update_window(window, |_, window, cx| {
+        app.update(cx, |app, cx| {
+            two_accounts(app);
+            app.begin_add_account(window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.find("add-account-backdrop").visible());
+        assert!(
+            window.find("cancel-add-account").visible(),
+            "the server step offers Cancel instead of Back"
+        );
+        assert!(window.try_find("back-to-welcome").is_none());
+        // Escape closes the sheet; the open account is untouched.
+        window.key_down("escape", false, cx);
+        window.render_frame(cx);
+        assert!(window.try_find("add-account-backdrop").is_none());
+    })
+    .expect("open and cancel the sheet");
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(!app.adding_account);
+        assert!(app.options.is_none());
+        assert_eq!(app.snapshot.user_id, user);
+    });
+}
+
+#[gpui_kit::test]
+fn add_account_options_step_offers_cancel_next_to_sign_in(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    cx.update_window(window, |_, window, cx| {
+        app.update(cx, |app, cx| {
+            app.begin_add_account(window, cx);
+            app.choosing_server = false;
+            app.options = Some(crate::backend::LoginOptions {
+                homeserver: "matrix.example.org".into(),
+                password: true,
+                browser: true,
+                sso: false,
+                providers: Vec::new(),
+            });
+        });
+        window.render_frame(cx);
+        assert!(window.find("browser-sign-in").visible());
+        assert!(window.find("add-account-backdrop").visible());
+        assert!(window.find("cancel-add-account").visible());
+    })
+    .expect("options step");
+}
+
+#[gpui_kit::test]
+fn sign_out_dialog_names_the_account_and_mentions_other_accounts(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    cx.update_window(window, |_, window, cx| {
+        app.update(cx, |app, cx| {
+            two_accounts(app);
+            app.open_management(crate::ui::spaces::ManageKind::SignOut, window, cx)
+        });
+        window.render_frame(cx);
+        assert!(window.find("sign-out-confirm").visible());
+        assert!(window.find("sign-out-cancel").visible());
+    })
+    .expect("open the sign-out dialog");
+    cx.update(|cx| {
+        let page = app.read(cx).management.as_ref().expect("dialog");
+        assert!(page.kind.is_dialog());
+    });
+}
+
+#[test]
+fn account_menu_uses_the_local_part_unless_it_is_ambiguous() {
+    use crate::backend::AccountEntry;
+    let entry = |user: &str| AccountEntry {
+        user_id: user.into(),
+        ..Default::default()
+    };
+    let one = [entry("@alice:example.org")];
+    assert_eq!(
+        crate::ui::account_label("@alice:example.org", &one),
+        "alice"
+    );
+    let clash = [entry("@alice:example.org"), entry("@alice:matrix.org")];
+    assert_eq!(
+        crate::ui::account_label("@alice:example.org", &clash),
+        "@alice:example.org"
+    );
+}
+
+#[gpui_kit::test]
+fn direct_downloads_offer_a_checked_installer_and_package_installs_do_not(cx: &mut TestAppContext) {
+    use crate::backend::UpdateDownload;
+    use twayblade_platform::updates::{Available, Download, DownloadError, Phase, Snapshot};
+    let (_main_window, app) = preview_window(cx);
+    let available = |command: Option<&str>| Snapshot {
+        phase: Phase::Available,
+        available: Some(Available {
+            version: "9.0.0".into(),
+            prerelease: false,
+            changelog: String::new(),
+            release_url: "https://github.com/zerw0/twayblade/releases/tag/v9.0.0".into(),
+            upgrade_command: command.map(str::to_owned),
+            download: command.is_none().then(|| Download {
+                file: "Twayblade-9.0.0-arm64.dmg".into(),
+                size: 10,
+                url: String::new(),
+                sums_url: String::new(),
+            }),
+        }),
+        ..Default::default()
+    };
+    cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            app.snapshot.updater = available(None);
+            app.open_settings(crate::ui::settings::Section::General, cx)
+        })
+    });
+    let window = cx.update(|cx| app.read(cx).settings.as_ref().unwrap().0);
+    let set = |cx: &mut TestAppContext, state: UpdateDownload| {
+        cx.update(|cx| {
+            app.update(cx, |app, cx| {
+                app.snapshot.update_download = state;
+                cx.notify();
+            })
+        })
+    };
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("update-download").visible());
+        assert!(window.try_find("update-open").is_none());
+    })
+    .expect("download offered");
+    set(
+        cx,
+        UpdateDownload::Downloading {
+            version: "9.0.0".into(),
+            received: 5,
+            total: 10,
+        },
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("update-download-progress").visible());
+        assert!(window.try_find("update-download").is_none());
+    })
+    .expect("downloading");
+    set(
+        cx,
+        UpdateDownload::Ready {
+            version: "9.0.0".into(),
+            path: "Twayblade-9.0.0-arm64.dmg".into(),
+        },
+    );
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("update-open").visible());
+    })
+    .expect("ready to open");
+    set(cx, UpdateDownload::Failed(DownloadError::ChecksumMismatch));
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.find("update-download").visible(),
+            "a failed check can be retried"
+        );
+        assert!(window.try_find("update-open").is_none());
+    })
+    .expect("mismatch");
+    // A package-managed install shows its command and offers no download.
+    cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            app.snapshot.updater = available(Some("brew upgrade --cask twayblade"));
+            app.snapshot.update_download = UpdateDownload::Idle;
+            cx.notify();
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("update-command").visible());
+        assert!(window.try_find("update-download").is_none());
+    })
+    .expect("package manager");
+}
+
+#[gpui_kit::test]
+fn selecting_composer_text_shows_a_format_bar_that_keeps_focus(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    cx.update_window(window, |_, window, cx| {
+        let composer = app.read(cx).composer.clone();
+        composer.update(cx, |state, cx| {
+            state.set_value("ship the notes", window, cx);
+            state.set_selected_range(5..8, cx);
+            state.focus(window, cx);
+        });
+        // The bar anchors to the laid-out selection, so it appears once the
+        // composer has been laid out.
+        window.render_frame(cx);
+        window.render_frame(cx);
+        assert!(window.find("selection-format-bar").visible());
+        window.click("selection-format-0", cx);
+        window.render_frame(cx);
+        let state = composer.read(cx);
+        assert_eq!(state.value().as_ref(), "ship **the** notes");
+        assert!(
+            gpui::Focusable::focus_handle(state, cx).is_focused(window),
+            "the composer keeps focus"
+        );
+        assert!(
+            !state.selected_range().is_empty(),
+            "the selection stays for another format"
+        );
+        // Collapsing the selection hides the bar.
+        composer.update(cx, |state, cx| state.set_selected_range(0..0, cx));
+        window.render_frame(cx);
+        assert!(window.try_find("selection-format-bar").is_none());
+    })
+    .expect("format bar");
 }
 
 #[gpui_kit::test]
@@ -2744,5 +2992,302 @@ fn bell_opens_notifications_and_a_row_opens_its_room(cx: &mut TestAppContext) {
             app.navigation.selected_room.as_deref(),
             Some(target.as_str())
         );
+    });
+}
+
+#[gpui_kit::test]
+fn f6_moves_between_areas_and_each_timeline_is_one_tab_stop(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
+    let (window, app) = preview_window(cx);
+    cx.update(|cx| cx.bind_keys(crate::shortcuts::bindings()));
+    cx.update_window(window, |_, window, cx| {
+        let press = |key: &str, window: &mut gpui_kit::Window, cx: &mut gpui_kit::App| {
+            window.key_down(key, false, cx);
+            window.render_frame(cx);
+        };
+        window.render_frame(cx);
+        let (room, ids) = {
+            let app = app.read(cx);
+            let ids: Vec<String> = app.snapshot.messages.iter().map(|m| m.id.clone()).collect();
+            (
+                app.navigation.selected_room.clone().expect("open room"),
+                ids,
+            )
+        };
+        let row = |id: &str, cx: &mut gpui_kit::App| {
+            app.update(cx, |app, cx| app.message_focus(false, id, cx))
+        };
+        app.update(cx, |app, cx| app.focus.focus(window, cx));
+        window.render_frame(cx);
+
+        // F6 from the title bar: the open conversation's row in the sidebar.
+        press("f6", window, cx);
+        let room_row = app.update(cx, |app, cx| app.room_focus(&room, cx));
+        assert!(room_row.is_focused(window), "F6 starts at the sidebar");
+        // Then the latest message.
+        press("f6", window, cx);
+        let latest = ids.last().unwrap();
+        assert!(
+            row(latest, cx).is_focused(window),
+            "F6 lands on the latest message"
+        );
+        // Arrows move through messages; Home goes to the first loaded one.
+        press("up", window, cx);
+        let previous = &ids[ids.len() - 2];
+        assert!(
+            row(previous, cx).is_focused(window),
+            "↑ moves to the previous message"
+        );
+        press("home", window, cx);
+        assert!(
+            row(&ids[0], cx).is_focused(window),
+            "Home moves to the first message"
+        );
+        // Then the message field, and back: the timeline remembers its message.
+        press("f6", window, cx);
+        let composer = app.read(cx).composer.clone();
+        assert!(
+            gpui::Focusable::focus_handle(composer.read(cx), cx).is_focused(window),
+            "F6 reaches the message field"
+        );
+        press("shift-f6", window, cx);
+        assert!(
+            row(&ids[0], cx).is_focused(window),
+            "⇧F6 returns to the message last moved to"
+        );
+        press("f6", window, cx);
+        press("f6", window, cx);
+        assert!(
+            room_row.is_focused(window),
+            "F6 wraps from the message field to the sidebar"
+        );
+
+        // Tab from the message: its own controls, then out of the timeline;
+        // no other message's controls are on the way.
+        press("shift-f6", window, cx);
+        press("shift-f6", window, cx);
+        assert!(row(&ids[0], cx).is_focused(window));
+        let area = app.read(cx).timeline_area.clone();
+        let mut controls = 0;
+        let mut reached_thread = false;
+        loop {
+            press("tab", window, cx);
+            if !area.contains_focused(window, cx) {
+                break;
+            }
+            controls += 1;
+            reached_thread |= window.find("thread-sample-0").focused() == Some(true);
+            let other = app
+                .read(cx)
+                .image_focus
+                .borrow()
+                .iter()
+                .find(|(key, handle)| handle.is_focused(window) && !key.ends_with("sample-0"))
+                .map(|(key, _)| key.clone());
+            assert_eq!(other, None, "Tab reached another message's control");
+            assert!(
+                controls < 10,
+                "Tab must leave the timeline after one message"
+            );
+        }
+        assert!(
+            reached_thread,
+            "the focused message's controls are reachable with Tab"
+        );
+    })
+    .expect("area and message keyboard navigation");
+}
+
+#[gpui_kit::test]
+fn opening_the_archive_scrolls_a_long_sidebar_to_it(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        app.update(cx, |app, cx| {
+            // Enough rooms to push the Archive below the sidebar's bottom edge.
+            let template = app
+                .snapshot
+                .rooms
+                .iter()
+                .find(|room| !room.is_space && !room.direct)
+                .cloned()
+                .expect("a sample room");
+            for ix in 0..60 {
+                let mut room = template.clone();
+                room.id = format!("filler-{ix}");
+                room.name = format!("Filler {ix}");
+                room.favourite = false;
+                app.snapshot.rooms.push(room);
+            }
+            app.set_archived("announcements".into(), true, window, cx);
+            app.show_archive(window, cx);
+        });
+        window.render_frame(cx);
+        window.render_frame(cx);
+        let height = window.viewport_size().height;
+        let row = window.find("room-announcements").bounds();
+        assert!(
+            row.top() >= gpui_kit::px(0.) && row.bottom() <= height,
+            "the archived room is scrolled into view: {row:?} in a {height:?} window"
+        );
+    })
+    .expect("archive scroll");
+}
+
+#[gpui_kit::test]
+fn a_notification_from_another_account_switches_and_then_opens_the_room(cx: &mut TestAppContext) {
+    use twayblade_platform::notifications::Activation;
+    let (window, app) = preview_window(cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        let (room, open) = app.update(cx, |app, _| {
+            let open = app.snapshot.account_instance;
+            app.snapshot.accounts = vec![
+                crate::backend::AccountEntry {
+                    id: "open".into(),
+                    active: true,
+                    instance: open,
+                    ..Default::default()
+                },
+                crate::backend::AccountEntry {
+                    id: "other".into(),
+                    instance: open.wrapping_add(1),
+                    unread: 2,
+                    ..Default::default()
+                },
+            ];
+            let room = app
+                .snapshot
+                .rooms
+                .iter()
+                .find(|room| {
+                    !room.is_space && Some(&room.id) != app.navigation.selected_room.as_ref()
+                })
+                .expect("another room")
+                .id
+                .clone();
+            (room, open)
+        });
+        let target = Activation {
+            account: open.wrapping_add(1),
+            room: room.clone(),
+            thread: None,
+        };
+        app.update(cx, |app, cx| {
+            app.activate_notification(target.clone(), window, cx)
+        });
+        assert_eq!(
+            app.read(cx)
+                .pending_activation
+                .as_ref()
+                .map(|t| t.room.clone()),
+            Some(room.clone()),
+            "the click waits for the switch"
+        );
+        assert_ne!(app.read(cx).navigation.selected_room.as_ref(), Some(&room));
+        // The switch lands: this window now shows the other account.
+        app.update(cx, |app, cx| {
+            app.busy = false;
+            app.snapshot.account_instance = open.wrapping_add(1);
+            app.resolve_pending_activation(window, cx);
+        });
+        assert_eq!(app.read(cx).navigation.selected_room.as_ref(), Some(&room));
+        assert!(app.read(cx).pending_activation.is_none());
+
+        // A click for an account that is not signed in does nothing.
+        app.update(cx, |app, cx| {
+            app.activate_notification(
+                Activation {
+                    account: 12345,
+                    room: room.clone(),
+                    thread: None,
+                },
+                window,
+                cx,
+            )
+        });
+        assert!(app.read(cx).pending_activation.is_none());
+        // A switch that ends on another account forgets the click.
+        app.update(cx, |app, cx| {
+            app.pending_activation = Some(target.clone());
+            app.snapshot.account_instance = open;
+            app.busy = false;
+            app.resolve_pending_activation(window, cx);
+        });
+        assert!(app.read(cx).pending_activation.is_none());
+    })
+    .expect("cross-account notification");
+}
+
+#[gpui_kit::test]
+fn the_popover_lists_missed_calls_previews_and_marks_all_read(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    let target = cx.update(|cx| {
+        app.update(cx, |app, _| {
+            let room = app
+                .snapshot
+                .rooms
+                .iter_mut()
+                .find(|room| !room.is_space && room.id != app.snapshot.selected_room)
+                .expect("another room");
+            room.unread = 2;
+            let id = room.id.clone();
+            app.snapshot.missed_calls = vec![crate::backend::MissedCall {
+                room: id.clone(),
+                room_name: "Sample".into(),
+                caller: "@alex:example.org".into(),
+                caller_name: "Alex".into(),
+                video: false,
+                at: 1,
+            }];
+            app.snapshot.activity_previews.insert(
+                id.clone(),
+                twayblade_core::activity::RoomPreview {
+                    room: id.clone(),
+                    sender: "@alex:example.org".into(),
+                    sender_name: "Alex".into(),
+                    own: false,
+                    body: twayblade_core::activity::PreviewBody::Text("Sample text".into()),
+                    timestamp_ms: 1,
+                },
+            );
+            id
+        })
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("open-notifications", cx);
+        window.render_frame(cx);
+        assert!(
+            window
+                .find(gpui_kit::SharedString::from(format!(
+                    "activity-missed-{target}-1"
+                )))
+                .visible()
+        );
+        assert!(
+            window
+                .find(gpui_kit::SharedString::from(format!(
+                    "activity-room-{target}"
+                )))
+                .visible()
+        );
+        window.click("notifications-mark-read", cx);
+        window.render_frame(cx);
+        // With nothing left the popover says so and offers no Mark All.
+        assert!(
+            window
+                .try_find(gpui_kit::SharedString::from(format!(
+                    "activity-room-{target}"
+                )))
+                .is_none()
+        );
+        assert!(window.try_find("notifications-mark-read").is_none());
+    })
+    .expect("mark all read");
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(app.snapshot.missed_calls.is_empty());
+        assert!(app.snapshot.rooms.iter().all(|room| room.unread == 0));
     });
 }

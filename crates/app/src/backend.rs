@@ -26,8 +26,10 @@ use directory::{DirectoryState, PreviewState};
 pub(super) use media::MediaState;
 mod search;
 pub(super) use search::SearchState;
+mod background;
 mod notifications;
 mod presence;
+pub(crate) use calls::MissedCall;
 pub(super) use notifications::NotificationConfig;
 
 use twayblade_core::{DiscoveryError, auth::AuthError, profile::ProfileError, rooms::SyncStatus};
@@ -38,15 +40,24 @@ pub(super) use twayblade_core::{
 #[derive(Clone, Default)]
 pub(super) struct Snapshot {
     pub(super) updater: twayblade_platform::updates::Snapshot,
+    /// The installer download offered for direct-download installs (#56).
+    pub(super) update_download: UpdateDownload,
     pub(super) editing: Option<Editing>,
     pub(super) edit_error: Option<String>,
     pub(super) edit_saving: bool,
     pub(super) call: Option<twayblade_core::calls::CallState>,
     pub(super) incoming_calls: Vec<twayblade_core::calls::IncomingCall>,
+    /// Rings that ended unanswered this session, newest first (#99).
+    pub(super) missed_calls: Vec<calls::MissedCall>,
+    /// Latest-message previews for the rooms the notifications popover lists.
+    pub(super) activity_previews:
+        std::collections::HashMap<String, twayblade_core::activity::RoomPreview>,
     pub(super) room_calls: std::collections::HashMap<String, twayblade_core::calls::ActiveCall>,
     pub(super) preview_size: previews::PreviewSize,
     pub(super) revision: u64,
     pub(super) account_instance: u128,
+    /// Every saved account, in the order added; `active` marks the open one.
+    pub(super) accounts: Vec<AccountEntry>,
     pub(super) session_state: SessionState,
     pub(super) security: twayblade_core::security::SecuritySnapshot,
     pub(super) notifications: twayblade_core::notifications::RulesSnapshot,
@@ -85,6 +96,41 @@ pub(super) struct Snapshot {
     pub(super) timeline_status: String,
     /// Main timeline state behind `timeline_status`, for the view's layout.
     pub(super) timeline_phase: TimelineStatus,
+}
+
+/// One saved account in the switcher. No credentials or SDK handles.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct AccountEntry {
+    pub(super) id: String,
+    pub(super) user_id: String,
+    pub(super) homeserver: String,
+    pub(super) active: bool,
+    /// The open client's `instance_id` once it has synced; notification
+    /// clicks name accounts by it. 0 until known.
+    pub(super) instance: u128,
+    /// Unread messages outside muted rooms, and mentions (#97).
+    pub(super) unread: u64,
+    pub(super) mentions: u64,
+}
+
+/// The saved accounts, keeping the counts already known for each.
+fn account_entries(active: Option<&str>, known: &[AccountEntry]) -> Vec<AccountEntry> {
+    auth::saved_accounts()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|saved| {
+            let previous = known.iter().find(|entry| entry.id == saved.id);
+            AccountEntry {
+                active: active == Some(saved.id.as_str()),
+                instance: previous.map_or(0, |entry| entry.instance),
+                unread: previous.map_or(0, |entry| entry.unread),
+                mentions: previous.map_or(0, |entry| entry.mentions),
+                id: saved.id,
+                user_id: saved.user_id,
+                homeserver: saved.homeserver,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -164,6 +210,9 @@ struct State {
     leave_request: u64,
     leave_plan: Option<(String, Arc<twayblade_core::space_actions::LeavePlan>)>,
     typing_intent: Option<watch::Sender<Option<(String, bool)>>>,
+    /// Rooms whose ring was declined or dismissed here, until it ends.
+    handled_rings: std::collections::HashSet<String>,
+    activity_task: Option<JoinHandle<()>>,
 }
 
 impl State {
@@ -192,6 +241,10 @@ impl State {
         self.thread_conversation = None;
         self.conversation = None;
         self.typing_intent = None;
+        self.handled_rings.clear();
+        if let Some(task) = self.activity_task.take() {
+            task.abort();
+        }
         self.epoch = self.epoch.wrapping_add(1);
         self.selection = self.selection.wrapping_add(1);
     }
@@ -219,8 +272,15 @@ impl BrowserLogin {
 impl Snapshot {
     /// Account lifecycle resets retain only global application state.
     fn clear_account(&mut self, preview_size: previews::PreviewSize) {
+        // The other saved accounts keep their counts across a switch.
+        let mut accounts = std::mem::take(&mut self.accounts);
+        for account in &mut accounts {
+            account.active = false;
+        }
         *self = Self {
+            accounts,
             updater: self.updater.clone(),
+            update_download: self.update_download.clone(),
             revision: self.revision,
             reduce_motion: self.reduce_motion,
             preview_size,
@@ -241,6 +301,9 @@ pub(super) struct Backend {
     // Serialize lifecycle changes. GPUI invokes operations only on background workers.
     lifecycle: Mutex<()>,
     oauth: Mutex<Option<BrowserLogin>>,
+    update_download: Mutex<Option<JoinHandle<()>>>,
+    /// Saved accounts other than the open one, syncing in the background.
+    inactive: background::Inactive,
 }
 
 pub(super) fn render_viewer_image(
@@ -261,6 +324,24 @@ fn publish(sender: &watch::Sender<Snapshot>, update: impl FnOnce(&mut Snapshot))
         snapshot.reduce_motion = twayblade_platform::reduce_motion();
         snapshot.revision = snapshot.revision.wrapping_add(1);
     });
+}
+
+/// The direct-download installer, from the user's Download to Open Installer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) enum UpdateDownload {
+    #[default]
+    Idle,
+    Downloading {
+        version: String,
+        received: u64,
+        total: u64,
+    },
+    /// Size and SHA-256 matched the release.
+    Ready {
+        version: String,
+        path: std::path::PathBuf,
+    },
+    Failed(twayblade_platform::updates::DownloadError),
 }
 
 fn publish_updater(
@@ -375,8 +456,8 @@ fn auth_failure(error: AuthError) -> ServiceError {
         AuthError::Logout => {
             "Sign-out could not be completed. The session has been retained; retry when connected."
         }
-        AuthError::ExistingSession => {
-            "A saved session already exists. Restart to restore it before signing in again."
+        AuthError::DuplicateAccount => {
+            "You are already signed in to this account. Switch to it from the account menu."
         }
         AuthError::AlreadyRunning => "Twayblade is already running. Close the other window first.",
     })
@@ -510,7 +591,92 @@ impl Backend {
             state: Arc::new(Mutex::new(State::default())),
             lifecycle: Mutex::new(()),
             oauth: Mutex::new(None),
+            update_download: Mutex::new(None),
+            inactive: Default::default(),
         }))
+    }
+
+    /// Downloads the available release's installer for this machine and checks
+    /// it against the release's checksum; a new request replaces an older one.
+    pub(super) fn download_update(&self) -> Result<(), ServiceError> {
+        use twayblade_platform::updates::download;
+        let (version, target) = {
+            let snapshot = self.updates.borrow();
+            let available = snapshot
+                .updater
+                .available
+                .as_ref()
+                .ok_or_else(|| failure("No update is available."))?;
+            let target = available
+                .download
+                .clone()
+                .ok_or_else(|| failure("This release has no installer for this computer."))?;
+            (available.version.clone(), target)
+        };
+        let directory =
+            download::directory().ok_or_else(|| failure("No folder to save the update in."))?;
+        let mut task = self
+            .update_download
+            .lock()
+            .map_err(|_| failure("The update download is unavailable."))?;
+        if let Some(previous) = task.take() {
+            previous.abort();
+        }
+        let updates = self.updates.clone();
+        let total = target.size;
+        publish(&updates, |view| {
+            view.update_download = UpdateDownload::Downloading {
+                version: version.clone(),
+                received: 0,
+                total,
+            }
+        });
+        *task = Some(self.runtime.spawn(async move {
+            let mut shown = 0u64;
+            let result = download::fetch(&target, &directory, |received| {
+                // About once per percent.
+                if received.saturating_sub(shown) >= (total / 100).max(1) || received == total {
+                    shown = received;
+                    publish(&updates, |view| {
+                        if let UpdateDownload::Downloading { received: now, .. } =
+                            &mut view.update_download
+                        {
+                            *now = received;
+                        }
+                    });
+                }
+            })
+            .await;
+            publish(&updates, |view| {
+                view.update_download = match result {
+                    Ok(path) => UpdateDownload::Ready { version, path },
+                    Err(error) => UpdateDownload::Failed(error),
+                }
+            });
+        }));
+        Ok(())
+    }
+
+    /// Opens the verified installer. Not during a call: installing replaces the
+    /// app the call runs in.
+    pub(super) fn open_update(&self) -> Result<(), ServiceError> {
+        let (in_call, path) = {
+            let snapshot = self.updates.borrow();
+            let in_call = snapshot.call.as_ref().is_some_and(|call| {
+                !matches!(call.phase, twayblade_core::calls::CallPhase::Ended(_))
+            });
+            let path = match &snapshot.update_download {
+                UpdateDownload::Ready { path, .. } => Some(path.clone()),
+                _ => None,
+            };
+            (in_call, path)
+        };
+        if in_call {
+            return Err(failure("Leave the call before installing the update."));
+        }
+        let path = path.ok_or_else(|| failure("Download the update first."))?;
+        twayblade_platform::updates::download::open(&path)
+            .map_err(|_| failure("The installer could not be opened."))
     }
 
     pub(super) fn configure_updates(&self, preferences: twayblade_platform::updates::Preferences) {
@@ -557,11 +723,14 @@ impl Backend {
         }
     }
 
+    /// `add` signs in another account next to the saved ones; otherwise a
+    /// signed-out session is resumed when there is one.
     pub(super) fn login(
         &self,
         homeserver: String,
         username: String,
         password: String,
+        add: bool,
     ) -> Result<(), ServiceError> {
         let _lifecycle = self
             .lifecycle
@@ -574,6 +743,7 @@ impl Backend {
             .map_err(|_| failure("Session is unavailable."))?
             .account
             .clone()
+            .filter(|_| !add)
             .filter(|account| *account.session_state().borrow() == SessionState::SoftLoggedOut);
         let account = self
             .runtime
@@ -593,6 +763,7 @@ impl Backend {
         homeserver: String,
         sso: bool,
         provider: Option<String>,
+        add: bool,
     ) -> Result<String, ServiceError> {
         let _lifecycle = self
             .lifecycle
@@ -604,6 +775,7 @@ impl Backend {
             .map_err(|_| failure("Session is unavailable."))?
             .account
             .clone()
+            .filter(|_| !add)
             .filter(|account| *account.session_state().borrow() == SessionState::SoftLoggedOut);
         let pending = self
             .runtime
@@ -688,7 +860,157 @@ impl Backend {
         publish(&self.updates, |snapshot| {
             snapshot.clear_account(state.previews.size);
         });
-        Ok(())
+        drop(state);
+        self.open_next_account()
+    }
+
+    /// Opens another saved account (from the account menu). Refused during a
+    /// call, which belongs to the open account.
+    pub(super) fn switch_account(&self, id: String) -> Result<(), ServiceError> {
+        let _lifecycle = self
+            .lifecycle
+            .lock()
+            .map_err(|_| failure("Session is unavailable."))?;
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| failure("Session is unavailable."))?;
+            if state
+                .account
+                .as_ref()
+                .is_some_and(|account| account.id() == id)
+            {
+                return Ok(());
+            }
+            let in_call = self.updates.borrow().call.as_ref().is_some_and(|call| {
+                !matches!(call.phase, twayblade_core::calls::CallPhase::Ended(_))
+            });
+            if in_call || state.call_task.is_some() {
+                return Err(failure("Leave the call before switching accounts."));
+            }
+        }
+        // Stop the open account first so its sync, notifications and calls end
+        // before the other store is opened.
+        let previous = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| failure("Session is unavailable."))?;
+            state.stop();
+            state.account.take()
+        };
+        twayblade_platform::notifications::clear_launch_activation();
+        // The background client becomes the open one; the previous one keeps
+        // syncing in its place.
+        let account = match self.take_inactive(&id) {
+            Some(account) => Ok(account),
+            None => self
+                .runtime
+                .block_on(auth::restore_account(&id))
+                .map_err(auth_failure),
+        };
+        if let Some(previous) = previous {
+            self.demote(previous);
+        }
+        match account {
+            Ok(account) => self.connect(account),
+            Err(error) => {
+                // Fall back to an account that opens, so the window is never
+                // left without one while others are saved.
+                let _ = self.open_next_account();
+                Err(error)
+            }
+        }
+    }
+
+    /// After a sign-out: open the first remaining saved account, if any.
+    fn open_next_account(&self) -> Result<(), ServiceError> {
+        let Some(next) = auth::saved_accounts()
+            .map_err(auth_failure)?
+            .into_iter()
+            .next()
+        else {
+            publish(&self.updates, |snapshot| snapshot.accounts.clear());
+            return Ok(());
+        };
+        let account = match self.take_inactive(&next.id) {
+            Some(account) => account,
+            None => self
+                .runtime
+                .block_on(auth::restore_account(&next.id))
+                .map_err(auth_failure)?,
+        };
+        self.connect(account)
+    }
+
+    /// Loads latest-message previews for the rooms the notifications popover
+    /// lists; a newer request replaces an unfinished one.
+    pub(super) fn request_previews(&self, rooms: Vec<String>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(account) = state.account.clone() else {
+            return;
+        };
+        let epoch = state.epoch;
+        if let Some(task) = state.activity_task.take() {
+            task.abort();
+        }
+        let shared = self.state.clone();
+        let updates = self.updates.clone();
+        state.activity_task = Some(self.runtime.spawn(async move {
+            let previews = account.room_previews(&rooms).await;
+            let Ok(state) = shared.lock() else {
+                return;
+            };
+            if state.epoch != epoch {
+                return;
+            }
+            let previews: std::collections::HashMap<_, _> = previews
+                .into_iter()
+                .map(|preview| (preview.room.clone(), preview))
+                .collect();
+            if updates.borrow().activity_previews != previews {
+                publish(&updates, |view| view.activity_previews = previews);
+            }
+        }));
+    }
+
+    /// Marks the listed rooms read and clears the missed calls (the
+    /// popover's Mark All as Read).
+    pub(super) fn mark_all_read(&self, rooms: Vec<String>) -> Result<(), ServiceError> {
+        let account = self
+            .state
+            .lock()
+            .map_err(|_| failure("Session is unavailable."))?
+            .account
+            .clone()
+            .ok_or_else(|| failure("No saved session."))?;
+        let instance = account.instance_id();
+        let result = self.runtime.block_on(account.mark_rooms_read(&rooms));
+        publish(&self.updates, |view| {
+            if view.account_instance == instance {
+                view.missed_calls.clear();
+            }
+        });
+        result.map_err(|_| failure("Some conversations could not be marked as read. Try again."))
+    }
+
+    /// Forgets the missed calls of `room` (it was opened), or all of them.
+    pub(super) fn clear_missed_calls(&self, room: Option<&str>) {
+        let present = self
+            .updates
+            .borrow()
+            .missed_calls
+            .iter()
+            .any(|call| room.is_none_or(|room| call.room == room));
+        if present {
+            publish(&self.updates, |view| {
+                view.missed_calls
+                    .retain(|call| room.is_some_and(|room| call.room != room));
+            });
+        }
     }
 
     pub(super) fn security_action(
@@ -1610,7 +1932,8 @@ impl Backend {
         publish(&self.updates, |snapshot| {
             snapshot.clear_account(state.previews.size);
         });
-        Ok(())
+        drop(state);
+        self.open_next_account()
     }
 
     pub(super) fn stop(&self) {
@@ -1643,7 +1966,14 @@ impl Backend {
                 .map_err(|_| failure("Notification settings could not be saved. Try again."))
         })
     }
+    /// Opens `account` and then the other saved accounts in the background.
     fn connect(&self, account: Account) -> Result<(), ServiceError> {
+        let result = self.connect_open(account);
+        self.sync_inactive();
+        result
+    }
+
+    fn connect_open(&self, account: Account) -> Result<(), ServiceError> {
         let _runtime = self.runtime.enter();
         let security = twayblade_core::security::Security::new(&account);
         let mut security_updates = security.subscribe();
@@ -1659,6 +1989,7 @@ impl Backend {
             snapshot.clear_account(state.previews.size);
             snapshot.user_id = account.user_id();
             snapshot.account_instance = account.instance_id();
+            snapshot.accounts = account_entries(Some(&account.id()), &snapshot.accounts);
             snapshot.sync_status = "Connecting…".into();
         });
         calls::observe(self, &mut state, account.clone());
@@ -1767,7 +2098,11 @@ impl Backend {
                         last = Some((snapshot.rooms.len(), code));
                         tracing::debug!(name: "rooms_snapshot", rooms = snapshot.rooms.len(), status = code);
                     }
+                    let counts = background::totals(&snapshot.rooms);
+                    let open = rooms_account.id();
+                    let instance = rooms_account.instance_id();
                     publish(&updates, |view| {
+                        background::set_counts(&mut view.accounts, &open, instance, counts);
                         view.sync_status = text.into();
                         view.offline = offline;
                         view.unread_total = snapshot
@@ -1835,6 +2170,12 @@ impl Drop for Backend {
         // The fields drop the runtime before anything else, so release the
         // account (and its SDK stores) now, while the runtime is still up.
         release_in_runtime(&self.runtime, state);
+        let inactive = self
+            .inactive
+            .try_lock()
+            .map(|mut accounts| std::mem::take(&mut *accounts))
+            .unwrap_or_default();
+        release_in_runtime(&self.runtime, inactive);
     }
 }
 
@@ -1890,6 +2231,7 @@ mod tests {
                 changelog: "Fixture release changes".into(),
                 release_url: "https://github.com/zerw0/twayblade/releases/tag/v2.0.0".into(),
                 upgrade_command: Some("brew upgrade --cask twayblade".into()),
+                download: None,
             }),
             ..Default::default()
         };

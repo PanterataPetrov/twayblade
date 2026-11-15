@@ -66,6 +66,34 @@ impl MatrixApp {
         cx.notify();
     }
 
+    /// Starts the installer download for a direct-download install.
+    pub fn download_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.job(
+            window,
+            cx,
+            |backend| backend.download_update(),
+            |this, result, _, _| {
+                if let Err(error) = result {
+                    this.status = error.to_string();
+                }
+            },
+        );
+    }
+
+    /// Opens the downloaded, checked installer (not during a call).
+    pub fn open_update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.job(
+            window,
+            cx,
+            |backend| backend.open_update(),
+            |this, result, _, _| {
+                if let Err(error) = result {
+                    this.status = error.to_string();
+                }
+            },
+        );
+    }
+
     pub fn start_call(
         &self,
         room_id: String,
@@ -268,6 +296,9 @@ pub(super) struct MatrixApp {
     pub notification_sample: bool,
     pub notification_window_active: bool,
     pub last_notification_click: u64,
+    /// A notification click from another signed-in account, opened once the
+    /// switch to it has landed (#97).
+    pub pending_activation: Option<twayblade_platform::notifications::Activation>,
     pub notification_thread: Option<(String, String)>,
     pub account_name: Option<Entity<InputState>>,
     pub account_edit_busy: bool,
@@ -279,6 +310,9 @@ pub(super) struct MatrixApp {
     pub password: Entity<InputState>,
     pub search: Entity<InputState>,
     pub composer: Entity<TextareaState>,
+    /// Formatting bars over selected text in the room and thread composers.
+    pub(crate) selection_bar: Entity<crate::ui::selection_bar::SelectionBar>,
+    pub(crate) thread_selection_bar: Entity<crate::ui::selection_bar::SelectionBar>,
     composers: HashMap<String, (Entity<TextareaState>, Subscription)>,
     pub scroller: Entity<MessageScrollerState>,
     pub focus: FocusHandle,
@@ -287,8 +321,14 @@ pub(super) struct MatrixApp {
     pub(super) choosing_server: bool,
     pub status: String,
     pub busy: bool,
+    /// The sign-in flow is open as a sheet over the workspace, adding another
+    /// account; Cancel returns to the open one.
+    pub(super) adding_account: bool,
+    pub(super) add_account_focus: FocusHandle,
     /// The title-bar notifications popover.
     pub(crate) notifications_open: bool,
+    /// The rooms (and their recency) whose previews were last requested.
+    pub(crate) activity_previews_key: Vec<(String, u64)>,
     pub(crate) notifications_closed_at: Option<std::time::Instant>,
     pub(crate) notifications_focus: FocusHandle,
     /// The room list column; the space rail stays visible (⌃⌘S).
@@ -371,6 +411,18 @@ pub(super) struct MatrixApp {
     pub viewer_request: u64,
     pub reveal_image: Option<String>,
     pub image_focus: std::cell::RefCell<HashMap<String, FocusHandle>>,
+    /// The message holding each timeline's one tab stop (main, thread); None
+    /// follows the latest. See `ui::focus`.
+    pub message_cursor: [Option<String>; 2],
+    /// Whether focus is on that message or its controls, refreshed each frame.
+    pub message_cursor_focused: [bool; 2],
+    /// Containers F6 moves between; they are never tab stops themselves.
+    pub sidebar_area: FocusHandle,
+    pub timeline_area: FocusHandle,
+    pub thread_area: FocusHandle,
+    pub sidebar_scroll: ScrollHandle,
+    /// Scroll the sidebar to the Archive on the next frame.
+    pub(super) reveal_archive: bool,
     pub invite_pending: HashSet<String>,
     pub profile: Option<ProfilePage>,
     /// Room details panel; the profile view replaces it while open.
@@ -654,6 +706,7 @@ impl MatrixApp {
             notification_sample: false,
             notification_window_active: window.is_window_active(),
             last_notification_click: 0,
+            pending_activation: None,
             notification_thread: None,
             notification_keyword: cx.new(|cx| InputState::new(window, cx).placeholder("Keyword")),
             account_edit_busy: false,
@@ -668,6 +721,10 @@ impl MatrixApp {
             username,
             password,
             search,
+            selection_bar: cx
+                .new(|cx| crate::ui::selection_bar::SelectionBar::new(composer.clone(), cx)),
+            thread_selection_bar: cx
+                .new(|cx| crate::ui::selection_bar::SelectionBar::new(composer.clone(), cx)),
             composer,
             composers: HashMap::new(),
             scroller,
@@ -676,7 +733,10 @@ impl MatrixApp {
             choosing_server: false,
             status: String::new(),
             busy: !preview,
+            adding_account: false,
+            add_account_focus: cx.focus_handle(),
             notifications_open: false,
+            activity_previews_key: Vec::new(),
             notifications_closed_at: None,
             notifications_focus: cx.focus_handle(),
             sidebar_open: true,
@@ -744,6 +804,13 @@ impl MatrixApp {
             viewer_request: 0,
             reveal_image: None,
             image_focus: std::cell::RefCell::new(HashMap::new()),
+            message_cursor: [None, None],
+            message_cursor_focused: [false, false],
+            sidebar_area: cx.focus_handle(),
+            timeline_area: cx.focus_handle(),
+            thread_area: cx.focus_handle(),
+            sidebar_scroll: ScrollHandle::new(),
+            reveal_archive: false,
             invite_pending: HashSet::new(),
             profile: None,
             details_open: false,
@@ -987,6 +1054,9 @@ impl MatrixApp {
             self.security_input = cx.new(|cx| InputState::new(window, cx).masked(true));
             // Status from sign-in or a previous account must not enter this workspace.
             self.status.clear();
+            self.adding_account = false;
+            self.options = None;
+            self.choosing_server = false;
             self.reset_pagination();
             self.navigation = Navigation::default();
             self.composers.clear();
@@ -1128,12 +1198,14 @@ impl MatrixApp {
         }
         self.sync_edit(window, cx);
         self.notification_config();
+        self.sync_activity_previews();
         if let Some((serial, target)) = self.snapshot.notification_click.clone()
             && serial != self.last_notification_click
         {
             self.last_notification_click = serial;
             self.activate_notification(target, window, cx);
         }
+        self.resolve_pending_activation(window, cx);
         self.open_pending_notification_thread(window, cx);
         self.refresh_viewer(window, cx);
         cx.notify();
@@ -1264,7 +1336,8 @@ impl MatrixApp {
         let (cancel, receiver) = tokio::sync::watch::channel(false);
         self.oauth_cancel = Some(cancel);
         let address = self.homeserver.read(cx).value().to_string();
-        self.job(window, cx, move |backend| backend.begin_oauth(address, sso, provider), move |this, result, window, cx| {
+        let add = self.adding_account;
+        self.job(window, cx, move |backend| backend.begin_oauth(address, sso, provider, add), move |this, result, window, cx| {
             match result {
                 Ok(url) => {
                     // Never retain the authorization URL in a snapshot or diagnostics.
@@ -1320,10 +1393,11 @@ impl MatrixApp {
             .update(cx, |state, cx| state.set_value("", window, cx));
         self.busy = true;
         self.status = "Signing in…".into();
+        let add = self.adding_account;
         self.job(
             window,
             cx,
-            move |backend| backend.login(address, username, password),
+            move |backend| backend.login(address, username, password, add),
             |this, result, _, _| {
                 this.busy = false;
                 if let Err(error) = result {
@@ -1360,7 +1434,51 @@ impl MatrixApp {
             self.select_space(None, window, cx);
         }
         self.collapsed_sections.remove("archive");
+        self.reveal_archive = true;
+        // Keyboard and VoiceOver users land in the Archive too; the menu leaves
+        // focus where its item moved it.
+        let first = self
+            .snapshot
+            .rooms
+            .iter()
+            .find(|room| {
+                room.archived
+                    && !room.is_space
+                    && self.navigation.room_visible(&room.id, &self.snapshot)
+            })
+            .map(|room| room.id.clone());
+        if let Some(room) = first
+            && self.search.read(cx).value().is_empty()
+        {
+            let handle = self.room_focus(&room, cx);
+            window.focus(&handle, cx);
+        }
         cx.notify();
+    }
+
+    /// Opens a notification from another account once the switch has landed
+    /// and its room is listed; forgets it if the switch ended elsewhere.
+    pub(crate) fn resolve_pending_activation(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(target) = self.pending_activation.take() else {
+            return;
+        };
+        let here = target.account == self.snapshot.account_instance;
+        if here
+            && self
+                .snapshot
+                .rooms
+                .iter()
+                .any(|room| room.id == target.room)
+        {
+            self.activate_notification(target, window, cx);
+        } else if here || self.busy {
+            // Still switching, or its rooms are still loading.
+            self.pending_activation = Some(target);
+        }
     }
 
     pub(super) fn activate_notification(
@@ -1369,12 +1487,27 @@ impl MatrixApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if target.account != self.snapshot.account_instance
-            || !self
+        if target.account != self.snapshot.account_instance {
+            // Another signed-in account: switch to it, then open the room.
+            if let Some(id) = self
                 .snapshot
-                .rooms
+                .accounts
                 .iter()
-                .any(|room| room.id == target.room)
+                .find(|account| !account.active && account.instance == target.account)
+                .map(|account| account.id.clone())
+            {
+                self.pending_activation = Some(target);
+                cx.activate(true);
+                window.activate_window();
+                self.switch_account(id, window, cx);
+            }
+            return;
+        }
+        if !self
+            .snapshot
+            .rooms
+            .iter()
+            .any(|room| room.id == target.room)
         {
             return;
         }
@@ -1404,6 +1537,16 @@ impl MatrixApp {
     }
 
     pub fn select_room(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        // Opening the room answers its missed calls.
+        if let Some(backend) = &self.backend
+            && self
+                .snapshot
+                .missed_calls
+                .iter()
+                .any(|call| call.room == id)
+        {
+            backend.clear_missed_calls(Some(&id));
+        }
         self.select_room_target(id, None, window, cx);
     }
     fn select_room_target(
@@ -1946,6 +2089,69 @@ impl MatrixApp {
     pub fn close_profile(&mut self, cx: &mut Context<Self>) {
         self.profile_request = self.profile_request.wrapping_add(1);
         self.profile = None;
+        cx.notify();
+    }
+
+    /// Add Account…: the sign-in flow as a sheet, starting at the server step.
+    pub fn begin_add_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.adding_account = true;
+        self.options = None;
+        self.choosing_server = true;
+        self.status.clear();
+        for input in [&self.homeserver, &self.username, &self.password] {
+            input.update(cx, |state, cx| state.set_value("", window, cx));
+        }
+        self.homeserver
+            .update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Cancel in the Add Account sheet; the open account is untouched.
+    pub fn cancel_add_account(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.adding_account = false;
+        self.options = None;
+        self.choosing_server = false;
+        self.status.clear();
+        self.password
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.restore_focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn switch_account(&mut self, id: String, window: &Window, cx: &mut Context<Self>) {
+        if self.busy
+            || self.preview
+            || self
+                .snapshot
+                .accounts
+                .iter()
+                .any(|account| account.active && account.id == id)
+        {
+            return;
+        }
+        self.busy = true;
+        self.status = "Switching account…".into();
+        self.job(
+            window,
+            cx,
+            move |backend| backend.switch_account(id),
+            |this, result, _, _| {
+                this.busy = false;
+                match result {
+                    Ok(()) => this.status.clear(),
+                    Err(error) => {
+                        this.pending_activation = None;
+                        this.status = error.to_string();
+                    }
+                }
+            },
+        );
         cx.notify();
     }
 

@@ -6,8 +6,11 @@
 // Areas of the main window.
 mod activity;
 mod chrome;
+#[cfg(all(test, feature = "capture"))]
+pub(crate) use chrome::account_label;
 pub(crate) mod conversation;
 mod panels;
+pub(crate) mod selection_bar;
 mod sign_in;
 mod timeline;
 
@@ -18,6 +21,7 @@ pub(crate) mod call_layout;
 pub(crate) mod calls;
 pub(crate) mod editing;
 pub(crate) mod emoji;
+pub(crate) mod focus;
 pub(crate) mod keyboard;
 pub(crate) mod motion;
 pub(crate) mod security;
@@ -232,6 +236,7 @@ impl Render for MatrixApp {
         self.sync_call_views(window, cx);
         self.sync_ringtone();
         self.sync_room_loading(cx);
+        self.sync_message_cursors(window, cx);
         if self.security_open {
             self.security_open = false;
             self.open_settings(crate::ui::settings::Section::Security, cx);
@@ -374,6 +379,8 @@ impl Render for MatrixApp {
                 )
                 .into_any_element()
         };
+        // The sidebar applied the Archive scroll while building `content`.
+        self.reveal_archive = false;
         let overlay = self.viewer.as_ref().map(|_| self.viewer_view(window, cx));
         let workspace = !self.security_open
             && !self.snapshot.user_id.is_empty()
@@ -411,6 +418,16 @@ impl Render for MatrixApp {
                     this.open_settings(crate::ui::settings::Section::Keyboard, cx)
                 }),
             )
+            .on_action(
+                cx.listener(|this, _: &crate::shortcuts::FocusNextArea, window, cx| {
+                    this.focus_next_area(true, window, cx)
+                }),
+            )
+            .on_action(cx.listener(
+                |this, _: &crate::shortcuts::FocusPreviousArea, window, cx| {
+                    this.focus_next_area(false, window, cx)
+                },
+            ))
             .on_action(cx.listener(|this, _: &FindConversation, window, cx| {
                 this.search.update(cx, |state, cx| state.focus(window, cx))
             }))
@@ -431,6 +448,8 @@ impl Render for MatrixApp {
             .on_action(cx.listener(|this, _: &CloseProfile, window, cx| {
                 if this.notifications_open {
                     this.close_notifications(window, cx);
+                } else if this.adding_account {
+                    this.cancel_add_account(window, cx);
                 } else if this.call_fills_window() {
                     this.toggle_call_full_screen(window, cx);
                 } else if this.call_focus.is_some() && this.live_call().is_some() {
@@ -516,6 +535,9 @@ impl Render for MatrixApp {
                     .flex_1()
                     .min_h_0()
                     .child(content)
+                    .when(self.adding_account && workspace, |view| {
+                        view.child(self.add_account_sheet(cx))
+                    })
                     .children(overlay)
                     .when(self.notification_sample, |view| {
                         view.child(self.notification_sample_view(cx))

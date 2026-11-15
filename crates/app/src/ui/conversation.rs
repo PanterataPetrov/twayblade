@@ -256,6 +256,14 @@ impl MatrixApp {
             .with_row_style(StyleRefinement::default().px_0().pb_0())
             .into_any_element()
         };
+        // The messages area F6 lands in; never a Tab stop itself.
+        let body = v_flex()
+            .id("timeline-area")
+            .track_focus(&self.timeline_area)
+            .flex_1()
+            .min_h_0()
+            .child(body)
+            .into_any_element();
 
         let timeline_notice =
             if load == RoomLoad::Loading || (self.groups.is_empty() && load != RoomLoad::Ready) {
@@ -339,6 +347,12 @@ impl MatrixApp {
                             .px(px(12.))
                             .pt(px(8.))
                             .pb(px(2.))
+                            .child({
+                                let composer = self.composer.clone();
+                                self.selection_bar
+                                    .update(cx, |bar, cx| bar.track(&composer, cx));
+                                self.selection_bar.clone()
+                            })
                             .child(
                                 Textarea::new(&self.composer)
                                     .context_menu(crate::ui::keyboard::composer_context_menu(

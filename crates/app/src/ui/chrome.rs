@@ -319,6 +319,8 @@ impl MatrixApp {
                 }
             });
         let row = Button::new(SharedString::from(format!("room-{}", room.id)))
+            // A known handle, so F6 and the Archive menu item can focus the row.
+            .track_focus(&self.room_focus(&room.id, cx))
             .ghost()
             .w_full()
             .h(px(density.row()))
@@ -565,15 +567,73 @@ impl MatrixApp {
             .as_ref()
             .and_then(|presence| presence.status_msg.clone());
         let has_archive = self.snapshot.rooms.iter().any(|room| room.archived);
+        let accounts = self.snapshot.accounts.clone();
+        let other = other_accounts_unread(&accounts);
+        let sign_out_label = format!("Sign Out of {}…", account_label(&user, &accounts));
         let weak = cx.entity().downgrade();
         Button::new("my-profile")
             .ghost()
             .h(px(28.))
             .px(px(3.))
-            .accessibility_label("Account and status")
+            .accessibility_label(match other {
+                (_, mentions) if mentions > 0 => format!(
+                    "Account and status, {mentions} {} in other accounts",
+                    if mentions == 1 { "mention" } else { "mentions" }
+                ),
+                (unread, _) if unread > 0 => {
+                    format!("Account and status, {unread} unread in other accounts")
+                }
+                _ => "Account and status".into(),
+            })
             .tooltip(user.clone())
-            .child(self.with_presence(avatar.into_any_element(), own.as_ref(), 22., cx))
+            .child(
+                div()
+                    .relative()
+                    .child(self.with_presence(avatar.into_any_element(), own.as_ref(), 22., cx))
+                    // Other accounts have something new; their counts are in the menu.
+                    .when(other.0 > 0 || other.1 > 0, |avatar| {
+                        avatar.child(
+                            div()
+                                .absolute()
+                                .top(px(-2.))
+                                .right(px(-2.))
+                                .size(px(8.))
+                                .rounded_full()
+                                .border_1()
+                                .border_color(theme::palette(cx).chrome)
+                                .bg(if other.1 > 0 {
+                                    cx.theme().primary
+                                } else {
+                                    cx.theme().muted_foreground
+                                }),
+                        )
+                    }),
+            )
             .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                // Saved accounts first, the open one checked (shown once there
+                // is more than one), then Add Account….
+                if accounts.len() > 1 {
+                    for account in &accounts {
+                        let switch = weak.clone();
+                        let id = account.id.clone();
+                        menu =
+                            menu.item(account_menu_row(account).checked(account.active).on_click(
+                                move |_, window, cx| {
+                                    let _ = switch.update(cx, |this, cx| {
+                                        this.switch_account(id.clone(), window, cx)
+                                    });
+                                },
+                            ));
+                    }
+                }
+                let add = weak.clone();
+                menu = menu
+                    .item(
+                        PopupMenuItem::new("Add Account…").on_click(move |_, window, cx| {
+                            let _ = add.update(cx, |this, cx| this.begin_add_account(window, cx));
+                        }),
+                    )
+                    .separator();
                 let profile = weak.clone();
                 let id = user.clone();
                 menu = menu.item(PopupMenuItem::new("Your Profile").on_click(
@@ -623,6 +683,7 @@ impl MatrixApp {
                 let archive = weak.clone();
                 let invite = weak.clone();
                 let settings = weak.clone();
+                let sign_out = weak.clone();
                 menu.separator()
                     .item(
                         PopupMenuItem::new("Create Room…").on_click(move |_, window, cx| {
@@ -669,6 +730,17 @@ impl MatrixApp {
                             });
                         }),
                     )
+                    .item(PopupMenuItem::new(sign_out_label.clone()).on_click(
+                        move |_, window, cx| {
+                            let _ = sign_out.update(cx, |this, cx| {
+                                this.open_management(
+                                    crate::ui::spaces::ManageKind::SignOut,
+                                    window,
+                                    cx,
+                                )
+                            });
+                        },
+                    ))
             })
             .into_any_element()
     }
@@ -796,13 +868,18 @@ impl MatrixApp {
             .min_h_0()
             .px(px(8.))
             .pb(px(10.))
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .track_scroll(&self.sidebar_scroll);
+        // Direct children so far; the Archive is scrolled to by its index.
+        let mut children = 0;
         let typed = self.search.read(cx).value().trim().to_owned();
         if !typed.is_empty() {
             list = list.child(div().pt(px(6.)).child(self.search_messages_row(&typed, cx)));
+            children += 1;
         }
         if !self.snapshot.invites.is_empty() {
             list = list.child(self.invite_section(cx));
+            children += 1;
         }
         let favourites: Vec<&Room> = visible
             .iter()
@@ -820,6 +897,7 @@ impl MatrixApp {
         if !favourites.is_empty() {
             list =
                 list.child(self.sidebar_section("favourites", "Favourites", favourites, None, cx));
+            children += 1;
         }
         if !channels.is_empty() {
             list = list.child(self.sidebar_section(
@@ -829,6 +907,7 @@ impl MatrixApp {
                 Some(("Create Room…", crate::ui::spaces::ManageKind::Create)),
                 cx,
             ));
+            children += 1;
         }
         if !direct.is_empty() {
             list = list.child(self.sidebar_section(
@@ -838,9 +917,13 @@ impl MatrixApp {
                 Some(("New Direct Message…", crate::ui::spaces::ManageKind::Dm)),
                 cx,
             ));
+            children += 1;
         }
         if !archived.is_empty() {
             list = list.child(self.sidebar_section("archive", "Archive", archived, None, cx));
+            if self.reveal_archive {
+                self.sidebar_scroll.scroll_to_item(children);
+            }
         }
         if visible.is_empty() {
             let empty = if !query.is_empty() {
@@ -862,6 +945,7 @@ impl MatrixApp {
         }
         v_flex()
             .id("sidebar")
+            .track_focus(&self.sidebar_area)
             .role(Role::Navigation)
             .aria_label("Conversations")
             .w(px(SIDEBAR_WIDTH))
@@ -1090,9 +1174,117 @@ pub(crate) fn room_label(room: &Room, selected: bool) -> String {
     label
 }
 
+/// How the account menu names a user: the local part (`alice`) while it is
+/// unique among saved accounts, else the full Matrix ID.
+/// A saved account in the avatar menu: its ID, then for an account that is not
+/// open its unread count, accented only for mentions, as in the sidebar.
+fn account_menu_row(account: &crate::backend::AccountEntry) -> PopupMenuItem {
+    let user = account.user_id.clone();
+    let count = (!account.active).then_some((account.unread, account.mentions));
+    let label = account_row_label(account);
+    PopupMenuItem::element(move |_, cx| {
+        let badge = count.and_then(|(unread, mentions)| {
+            if mentions > 0 {
+                Some(
+                    badge(mentions, cx)
+                        .bg(cx.theme().primary)
+                        .text_color(cx.theme().primary_foreground),
+                )
+            } else {
+                (unread > 0).then(|| badge(unread, cx))
+            }
+        });
+        h_flex()
+            .id(SharedString::from(format!("account-row-{user}")))
+            .aria_label(label.clone())
+            .w_full()
+            .min_w(px(220.))
+            .gap(px(12.))
+            .child(div().flex_1().min_w_0().truncate().child(user.clone()))
+            .children(badge)
+    })
+}
+
+/// What a screen reader hears for an account row; the open account's counts
+/// are in its sidebar, so only other accounts mention theirs.
+pub(crate) fn account_row_label(account: &crate::backend::AccountEntry) -> String {
+    let user = &account.user_id;
+    match (account.active, account.unread, account.mentions) {
+        (false, _, mentions) if mentions > 0 => format!(
+            "{user}, {mentions} {}",
+            if mentions == 1 { "mention" } else { "mentions" }
+        ),
+        (false, unread, _) if unread > 0 => format!("{user}, {unread} unread"),
+        _ => user.clone(),
+    }
+}
+
+/// Unread messages in signed-in accounts that are not open.
+pub(crate) fn other_accounts_unread(accounts: &[crate::backend::AccountEntry]) -> (u64, u64) {
+    accounts
+        .iter()
+        .filter(|account| !account.active)
+        .fold((0, 0), |(unread, mentions), account| {
+            (
+                unread.saturating_add(account.unread),
+                mentions.saturating_add(account.mentions),
+            )
+        })
+}
+
+pub(crate) fn account_label(user_id: &str, accounts: &[crate::backend::AccountEntry]) -> String {
+    let local = |id: &str| {
+        id.strip_prefix('@')
+            .and_then(|rest| rest.split(':').next())
+            .unwrap_or(id)
+            .to_owned()
+    };
+    let mine = local(user_id);
+    let shared = accounts
+        .iter()
+        .filter(|account| account.user_id != user_id && local(&account.user_id) == mine)
+        .count();
+    if shared == 0 && !mine.is_empty() {
+        mine
+    } else {
+        user_id.to_owned()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Room, room_label};
+    use super::{Room, account_row_label, other_accounts_unread, room_label};
+    use crate::backend::AccountEntry;
+
+    #[test]
+    fn other_accounts_announce_mentions_before_unread() {
+        let entry = |active, unread, mentions| AccountEntry {
+            user_id: "@sam:example.org".into(),
+            active,
+            unread,
+            mentions,
+            ..Default::default()
+        };
+        assert_eq!(
+            account_row_label(&entry(false, 5, 2)),
+            "@sam:example.org, 2 mentions"
+        );
+        assert_eq!(
+            account_row_label(&entry(false, 5, 1)),
+            "@sam:example.org, 1 mention"
+        );
+        assert_eq!(
+            account_row_label(&entry(false, 3, 0)),
+            "@sam:example.org, 3 unread"
+        );
+        assert_eq!(account_row_label(&entry(false, 0, 0)), "@sam:example.org");
+        // The open account's counts are in its sidebar.
+        assert_eq!(account_row_label(&entry(true, 3, 1)), "@sam:example.org");
+        assert_eq!(
+            other_accounts_unread(&[entry(true, 9, 9), entry(false, 3, 1), entry(false, 2, 0)]),
+            (5, 1)
+        );
+    }
 
     #[test]
     fn room_rows_read_name_selection_and_attention() {

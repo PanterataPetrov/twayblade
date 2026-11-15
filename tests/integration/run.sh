@@ -71,7 +71,7 @@ case "${1:-test}" in
             scripts/cargo-pruned test --locked -p twayblade-core --all-features oauth_keychain_lifecycle_across_processes -- --ignored --nocapture
         fi
         ;;
-    up|test|keychain|services|archive|security|media|threads|spaces|viewer|search|directory|notifications|notification-delivery|room-open)
+    up|test|keychain|services|archive|security|media|threads|spaces|viewer|search|directory|notifications|notification-delivery|inactive-accounts|activity|room-open)
         mkdir -p test-data/local/integration
         "${compose[@]}" run --rm --no-deps --entrypoint python synapse /bootstrap.py generate
         if [[ "${1:-test}" == spaces ]]; then
@@ -93,8 +93,12 @@ case "${1:-test}" in
             elif [[ "${1:-test}" == search ]]; then
                 "${compose[@]}" exec -T synapse python /bootstrap.py register-security
                 scripts/cargo-pruned test --locked -p twayblade-core --all-features search_server_cached_encryption_pagination_and_event_context -- --ignored --nocapture
+            elif [[ "${1:-test}" == activity ]]; then
+                scripts/cargo-pruned test --locked -p twayblade-core --all-features activity_previews_and_mark_all_read -- --ignored --nocapture
             elif [[ "${1:-test}" == notification-delivery ]]; then
                 scripts/cargo-pruned test --locked -p twayblade-core --all-features encrypted_notification_delivery_and_private_preview -- --ignored --nocapture
+            elif [[ "${1:-test}" == inactive-accounts ]]; then
+                scripts/cargo-pruned test --locked -p twayblade-core --all-features inactive_account_counts_notifies_and_reopens_on_the_same_client -- --ignored --nocapture
             elif [[ "${1:-test}" == archive ]]; then
                 scripts/cargo-pruned test --locked -p twayblade-core --all-features archive_tag_round_trips_and_excludes_favourite -- --ignored --nocapture
             elif [[ "${1:-test}" == notifications ]]; then
@@ -115,6 +119,7 @@ case "${1:-test}" in
                 scripts/cargo-pruned test --locked -p twayblade-core --all-features secure_backup_fresh_store_recovery_and_sas -- --ignored --nocapture
             elif [[ "${1:-test}" == keychain ]]; then
                 scripts/cargo-pruned test --locked --workspace --all-features keychain_session_lifecycle_across_processes -- --ignored --nocapture
+                scripts/cargo-pruned test --locked -p twayblade-core --all-features -- --ignored --nocapture single_session_slot_migrates two_saved_accounts_switch
             elif [[ "${1:-test}" == services ]]; then
                 for test_name in encrypted_message_editing_sources_navigation_and_threads encrypted_delivery_profile_and_same_device_store_restore timeline_metadata_and_send_queue_actions members_typing_and_read_receipts pagination_preserves_message_identity room_list_service_tracks_recency_and_details; do
                     scripts/cargo-pruned test --locked -p twayblade-core --all-features "$test_name" -- --ignored --nocapture
@@ -126,5 +131,5 @@ case "${1:-test}" in
         ;;
     down) "${compose[@]}" down ;;
     status) "${compose[@]}" ps ;;
-    *) printf 'Usage: bash tests/integration/run.sh [call|up|test|keychain|services|presence|oauth|sso|recovery|security|media|threads|spaces|viewer|search|notifications|notification-delivery|room-open|down|status]\n' >&2; exit 1 ;;
+    *) printf 'Usage: bash tests/integration/run.sh [call|up|test|keychain|services|presence|oauth|sso|recovery|security|media|threads|spaces|viewer|search|notifications|notification-delivery|inactive-accounts|activity|room-open|down|status]\n' >&2; exit 1 ;;
 esac

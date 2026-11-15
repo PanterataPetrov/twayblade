@@ -1,4 +1,7 @@
 #![recursion_limit = "512"]
+// Release builds start without a console window on Windows; diagnostics go to
+// the log file. Debug builds keep the console for development output.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 extern crate gpui_kit as gpui;
 
 mod app;
@@ -169,10 +172,46 @@ fn main() {
                         view.options = Some(backend::LoginOptions { homeserver: "matrix.example.org".into(), password: false, browser: false, sso: true, providers: vec![twayblade_core::IdentityProvider { id: "sample".into(), name: "Example Identity".into(), icon_png: None }] });
                         view.status = "Sample data · Choose your identity provider.".into();
                     }
+                    if args.iter().any(|arg| arg == "--preview-update-download") {
+                        // Sample data: an available release with this Mac's installer downloaded and checked.
+                        view.snapshot.updater = twayblade_platform::updates::Snapshot { phase: twayblade_platform::updates::Phase::Available, available: Some(twayblade_platform::updates::Available { version: "0.2.0".into(), prerelease: true, changelog: "Sample release notes.".into(), release_url: "https://github.com/zerw0/twayblade/releases/tag/v0.2.0".into(), upgrade_command: None, download: Some(twayblade_platform::updates::Download { file: "Twayblade-0.2.0-arm64.dmg".into(), size: 1, url: String::new(), sums_url: String::new() }) }), ..Default::default() };
+                        view.snapshot.update_download = backend::UpdateDownload::Ready { version: "0.2.0".into(), path: "Twayblade-0.2.0-arm64.dmg".into() };
+                    }
+                    if args.iter().any(|arg| arg == "--preview-selection") {
+                        view.composer.update(cx, |state, cx| {
+                            state.set_value("Let's ship the release notes today", window, cx);
+                            state.set_selected_range(10..23, cx);
+                            state.focus(window, cx);
+                        });
+                    }
+                    if args.iter().any(|arg| arg.starts_with("--preview-add-account") || arg == "--preview-sign-out" || arg == "--preview-accounts-menu") {
+                        let me = view.snapshot.user_id.clone();
+                        view.snapshot.accounts = vec![
+                            backend::AccountEntry { id: "sample-1".into(), user_id: me, homeserver: "https://matrix.example.org/".into(), active: true, ..Default::default() },
+                            backend::AccountEntry { id: "sample-2".into(), user_id: "@sam.work:example.com".into(), homeserver: "https://example.com/".into(), active: false , instance: 2, unread: 4, mentions: 1 },
+                        ];
+                    }
+                    if args.iter().any(|arg| arg == "--preview-add-account") {
+                        view.adding_account = true;
+                        view.choosing_server = true;
+                    }
+                    if args.iter().any(|arg| arg == "--preview-add-account-options") {
+                        view.adding_account = true;
+                        view.options = Some(backend::LoginOptions { homeserver: "matrix.example.org".into(), password: true, browser: true, sso: false, providers: Vec::new() });
+                    }
+                    if args.iter().any(|arg| arg == "--preview-sign-out") { view.open_management(ui::spaces::ManageKind::SignOut, window, cx); }
                     if args.iter().any(|arg| arg == "--preview-activity") {
                         view.snapshot.invites = vec![twayblade_core::space_actions::Invite { id: "sample-room".into(), name: "Planning".into(), ..Default::default() }];
                         for (room, mentions) in view.snapshot.rooms.iter_mut().zip([2u64, 0, 0, 1]) { room.mentions = mentions; room.unread = room.unread.max(mentions).max(1); }
                         view.notifications_open = true;
+                        // Sample data only: a missed call and latest-message previews.
+                        let now = chrono::Utc::now().timestamp_millis() as u64;
+                        view.snapshot.missed_calls = vec![backend::MissedCall { room: "alex".into(), room_name: "Alex".into(), caller: "@alex:example.org".into(), caller_name: "Alex".into(), video: true, at: now - 12 * 60_000 }];
+                        let samples = [("Alex", "Can you check the new mockups before standup?"), ("Sam", "Pushed the release notes draft"), ("Alex", ""), ("Robin", "Thanks, looks good")];
+                        for (room, (sender, text)) in view.snapshot.rooms.iter().zip(samples) {
+                            let body = if text.is_empty() { twayblade_core::activity::PreviewBody::Image } else { twayblade_core::activity::PreviewBody::Text(text.into()) };
+                            view.snapshot.activity_previews.insert(room.id.clone(), twayblade_core::activity::RoomPreview { room: room.id.clone(), sender: format!("@{}:example.org", sender.to_lowercase()), sender_name: sender.into(), own: false, body, timestamp_ms: now });
+                        }
                     }
                     if args.iter().any(|arg| arg == "--preview-signed-out") {
                         view.snapshot.session_state = twayblade_core::auth::SessionState::HardLoggedOut;
@@ -226,6 +265,7 @@ fn main() {
                     if args.iter().any(|arg| arg == "--preview-leave") { view.open_management(ui::spaces::ManageKind::LeaveRoom("general".into()),window,cx); }
                     if args.iter().any(|arg| arg == "--preview-invite-contact") { view.open_management(ui::spaces::ManageKind::InviteContact,window,cx); }
                     if args.iter().any(|arg| arg == "--preview-archive") { for room in view.snapshot.rooms.iter_mut().filter(|room| room.id == "announcements") { room.archived = true; } view.show_archive(window, cx); }
+                    if args.iter().any(|arg| arg == "--preview-message-focus") { view.focus_next_area(true, window, cx); view.focus_next_area(true, window, cx); if let Some(id) = view.message_cursor(false).map(str::to_owned) { view.step_message(false, &id, ui::focus::Step::Previous, window, cx); } }
                     if args.iter().any(|arg| arg == "--preview-directory") { view.open_management(ui::spaces::ManageKind::Directory("design".into()),window,cx); }
                     if args.iter().any(|arg| arg == "--preview-invites") { view.status = "Sample data · Invitations preview".into(); view.snapshot.invites = vec![twayblade_core::space_actions::Invite { id: "sample-room".into(), name: "Planning".into(), ..Default::default() },twayblade_core::space_actions::Invite { id: "sample-dm".into(), name: "Sam".into(), direct: true, ..Default::default() },twayblade_core::space_actions::Invite { id: "sample-space".into(), name: "Product team".into(), space: true, ..Default::default() }]; }
                     if args.iter().any(|arg| arg == "--preview-notification") { view.notification_sample = true;
@@ -265,9 +305,20 @@ fn main() {
             #[cfg(feature = "capture")]
             if let Some(path) = capture {
                 let weak = view.downgrade();
+                let open_account_menu = args.iter().any(|arg| arg == "--preview-accounts-menu");
                 cx.spawn(async move |cx| {
+                    if open_account_menu {
+                        // Open the avatar menu the way a click would.
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(2))
+                            .await;
+                        let _ = main_window.update(cx, |_, window, cx| {
+                            use gpui_kit::test::TestWindowExt;
+                            window.click("my-profile", cx);
+                        });
+                    }
                     cx.background_executor()
-                        .timer(std::time::Duration::from_secs(3))
+                        .timer(std::time::Duration::from_secs(if open_account_menu { 1 } else { 3 }))
                         .await;
                     let settings = cx.update(|cx| weak.upgrade().and_then(|main| main.read(cx).settings.as_ref().map(|entry| entry.0)));
                     let result = settings.unwrap_or(main_window).update(cx, |_, window, cx| { window.refresh(); window.draw(cx).clear(cx); window.render_to_image() });

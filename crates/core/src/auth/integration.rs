@@ -403,6 +403,93 @@ fn keychain_session_lifecycle_across_processes() {
     eprintln!("PASS: OS Keychain persistence across processes, same device, logout/store deletion");
 }
 
+/// Two accounts side by side in their own credential slots: adding, refusing
+/// a duplicate, opening either one, and signing one out without the other.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires isolated Synapse and an unlocked macOS Keychain"]
+async fn two_saved_accounts_switch_and_sign_out_independently() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-data/local/integration");
+    let fixture: Fixture = checked(
+        serde_json::from_slice(&checked(
+            tokio::fs::read(root.join("fixture.json")).await,
+            "read fixture",
+        )),
+        "parse fixture",
+    );
+    assert!(
+        fixture.homeserver == "https://127.0.0.1:18448",
+        "Only loopback fixture allowed"
+    );
+    let certificate = checked(
+        Certificate::from_pem(&checked(
+            tokio::fs::read(root.join("ca.crt")).await,
+            "test CA",
+        )),
+        "parse test CA",
+    );
+    let run_id = Uuid::new_v4();
+    let context = AuthContext {
+        session_store: secrets::SessionStore::new(&format!("twayblade.integration.two.{run_id}")),
+        data_dir: root.join(format!("two-accounts-{run_id}")),
+        root_certificate: Some(certificate),
+    };
+    let sign_in = |user: &'static str, password: String| {
+        login_password_in(
+            &context,
+            fixture.homeserver.clone(),
+            user.into(),
+            Zeroizing::new(password),
+        )
+    };
+    let alice = checked(sign_in("alice", fixture.alice.clone()).await, "alice");
+    let bob = checked(sign_in("bob", fixture.bob.clone()).await, "bob");
+    let alice_device = alice.client.device_id().expect("device").to_owned();
+    let users = |context: &AuthContext| {
+        checked(saved_accounts_in(context), "list")
+            .into_iter()
+            .map(|account| account.user_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(users(&context).len(), 2);
+    assert!(
+        matches!(
+            sign_in("alice", fixture.alice.clone()).await,
+            Err(AuthError::DuplicateAccount)
+        ),
+        "the same user is not saved twice"
+    );
+    assert_eq!(users(&context).len(), 2, "the refused sign-in left nothing");
+    let (alice_id, bob_id) = (alice.id(), bob.id());
+    drop((alice, bob));
+
+    // Launch opens the account added last; either can then be opened.
+    let launched = checked(restore_in(&context).await, "launch").expect("saved");
+    assert_eq!(launched.id(), bob_id);
+    drop(launched);
+    let store_id = checked(Uuid::parse_str(&alice_id), "id");
+    let alice = checked(restore_entry(&context, store_id).await, "switch").expect("alice");
+    assert_eq!(alice.client.device_id(), Some(alice_device.as_ref()));
+    checked(alice.client.whoami().await, "alice session accepted");
+    drop(alice);
+    let launched = checked(restore_in(&context).await, "relaunch").expect("saved");
+    assert_eq!(launched.id(), alice_id, "the switch is remembered");
+
+    // Signing Bob out keeps Alice.
+    let bob_store = checked(Uuid::parse_str(&bob_id), "id");
+    let bob = checked(restore_entry(&context, bob_store).await, "bob").expect("bob");
+    checked(bob.logout().await, "bob sign-out");
+    assert!(checked(context.slot(bob_store).load().await, "bob slot").is_none());
+    assert!(!context.store_path(bob_store).exists());
+    assert_eq!(users(&context), [launched.user_id()]);
+    checked(launched.client.whoami().await, "alice still signed in");
+    checked(launched.logout().await, "alice sign-out");
+    assert!(users(&context).is_empty());
+    assert!(checked(restore_in(&context).await, "empty").is_none());
+    let _ = tokio::fs::remove_dir_all(&context.data_dir).await;
+    eprintln!("PASS: two accounts, duplicate refusal, switching and independent sign-out");
+}
+
 #[cfg(target_os = "macos")]
 #[derive(Serialize, Deserialize)]
 struct LifecycleEvidence {
@@ -464,7 +551,7 @@ async fn keychain_session_lifecycle_phase() {
             );
             assert!(
                 checked(
-                    context.session_store.load().await,
+                    context.saved_credential().await,
                     "failed login Keychain cleanup"
                 )
                 .is_none()
@@ -555,7 +642,7 @@ async fn keychain_session_lifecycle_phase() {
                 "Logout retained the store directory"
             );
             assert!(
-                checked(context.session_store.load().await, "Keychain after logout").is_none(),
+                checked(context.saved_credential().await, "Keychain after logout").is_none(),
                 "Logout retained credentials"
             );
             assert!(
@@ -1366,7 +1453,7 @@ async fn revoked_device_and_soft_logout_recovery() {
         );
         let path = account.store_path.clone();
         let device = checked(account.client.device_id().ok_or(()), "device").to_owned();
-        let before = checked(context.session_store.load().await, "saved session").unwrap();
+        let before = checked(context.saved_credential().await, "saved session").unwrap();
         let mut changes = account.session_state();
         let stream = account.room_updates();
         let sync = tokio::spawn(async move {
@@ -1461,7 +1548,7 @@ async fn revoked_device_and_soft_logout_recovery() {
             path.exists(),
             "store must be retained before recovery/confirmation"
         );
-        assert!(checked(context.session_store.load().await, "retained credential").is_some());
+        assert!(checked(context.saved_credential().await, "retained credential").is_some());
         if soft {
             assert!(
                 account
@@ -1470,7 +1557,7 @@ async fn revoked_device_and_soft_logout_recovery() {
                     .is_err()
             );
             assert!(
-                checked(context.session_store.load().await, "failed reauth record")
+                checked(context.saved_credential().await, "failed reauth record")
                     .unwrap()
                     .as_str()
                     == before.as_str(),
@@ -1494,7 +1581,7 @@ async fn revoked_device_and_soft_logout_recovery() {
             checked(second.logout().await, "second client logout");
         }
         assert!(!path.exists());
-        assert!(checked(context.session_store.load().await, "credential cleanup").is_none());
+        assert!(checked(context.saved_credential().await, "credential cleanup").is_none());
     }
 }
 
@@ -2586,6 +2673,286 @@ async fn encrypted_notification_delivery_and_private_preview() {
     alice_sync.abort();
     bob_sync.abort();
     eprintln!("PASS: encrypted SDK notification resolution, typed sender/body and private preview");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Synapse fixture"]
+async fn inactive_account_counts_notifies_and_reopens_on_the_same_client() {
+    // What the app does for a signed-in account that is not open (#97): only
+    // its room list syncs, with no room selected, alongside another account.
+    use crate::notifications::{NotificationContext, RoomMode, RuleChange};
+    use crate::rooms::{RoomSnapshot, SyncStatus};
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-data/local/integration");
+    let fixture: Fixture = checked(
+        serde_json::from_slice(&checked(
+            tokio::fs::read(root.join("fixture.json")).await,
+            "fixture",
+        )),
+        "parse fixture",
+    );
+    assert!(fixture.homeserver == "https://127.0.0.1:18448");
+    let cert = checked(
+        Certificate::from_pem(&checked(tokio::fs::read(root.join("ca.crt")).await, "CA")),
+        "parse CA",
+    );
+    let run = root.join(format!("inactive-account-{}", Uuid::new_v4()));
+    let mut accounts = Vec::new();
+    for (name, password) in [("alice", &fixture.alice), ("bob", &fixture.bob)] {
+        let client = test_client(&run, name, &Uuid::new_v4().to_string(), &cert).await;
+        checked(
+            client.matrix_auth().login_username(name, password).await,
+            "isolated login",
+        );
+        accounts.push(Account::new(
+            client,
+            run.join(name),
+            secrets::SessionStore::new("twayblade.integration.unused"),
+            Arc::new(Mutex::new(())),
+        ));
+    }
+    let alice = accounts[0].clone();
+    let bob = accounts[1].clone();
+    let alice_sync = sync(&alice);
+    // Bob is the inactive account: its room list and notifications only.
+    let watch_rooms = |account: Account| {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<RoomSnapshot>();
+        let task = tokio::spawn(async move {
+            let stream = account.room_updates();
+            tokio::pin!(stream);
+            while let Some(snapshot) = stream.next().await {
+                if sender.send(snapshot).is_err() {
+                    break;
+                }
+            }
+        });
+        (task, receiver)
+    };
+    let (bob_rooms, mut bob_snapshots) = watch_rooms(bob.clone());
+    let (_context, receiver) = tokio::sync::watch::channel(NotificationContext {
+        enabled: true,
+        active: false,
+        focused_room: None,
+    });
+    let (items, mut received) = tokio::sync::mpsc::channel(8);
+    let bob_notifications = bob.clone();
+    let notifications = tokio::spawn(async move {
+        let stream = bob_notifications.notification_updates(receiver);
+        tokio::pin!(stream);
+        while let Some(item) = stream.next().await {
+            if items.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut request = create_room::v3::Request::new();
+    request.name = Some("Inactive account room".into());
+    request.invite = vec![bob.client.user_id().expect("test user").to_owned()];
+    let room = checked(alice.client.create_room(request).await, "room");
+    checked(bob.client.join_room_by_id(room.room_id()).await, "join");
+    wait_for_room(&bob, room.room_id()).await;
+    wait_for_room(&alice, room.room_id()).await;
+    let rules = checked(bob.notification_rules().await, "notification rules");
+    checked(
+        rules
+            .change(RuleChange::Room(room.room_id().to_string(), RoomMode::All))
+            .await,
+        "room notifications",
+    );
+    async fn unread_at_least(
+        snapshots: &mut tokio::sync::mpsc::UnboundedReceiver<RoomSnapshot>,
+        id: &str,
+        count: u64,
+    ) {
+        checked(
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    let snapshot = snapshots.recv().await.expect("room stream");
+                    if snapshot
+                        .rooms
+                        .iter()
+                        .any(|room| room.id == id && room.unread >= count)
+                    {
+                        break;
+                    }
+                }
+            })
+            .await,
+            "unread count",
+        );
+    }
+    let room_id = room.room_id().to_string();
+    let event = checked(
+        room.send(RoomMessageEventContent::text_plain(
+            "for the inactive account",
+        ))
+        .await,
+        "send",
+    )
+    .response
+    .event_id;
+    unread_at_least(&mut bob_snapshots, &room_id, 1).await;
+    let item = checked(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let item = received.recv().await.expect("notification stream");
+                if item.event == event.as_str() {
+                    break item;
+                }
+            }
+        })
+        .await,
+        "notification without a selected room",
+    );
+    assert!(item.room == room.room_id().as_str() && item.sender == alice.user_id());
+
+    // Switching to Bob reuses this client: its room list stops and starts
+    // again, and it keeps following new messages.
+    bob_rooms.abort();
+    drop(bob_snapshots);
+    let (reopened, mut bob_snapshots) = watch_rooms(bob.clone());
+    checked(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let snapshot = bob_snapshots.recv().await.expect("reopened stream");
+                if snapshot.status == SyncStatus::Connected
+                    && snapshot
+                        .rooms
+                        .iter()
+                        .any(|r| r.id == room.room_id().as_str())
+                {
+                    break;
+                }
+            }
+        })
+        .await,
+        "reopened room list",
+    );
+    checked(
+        room.send(RoomMessageEventContent::text_plain("after the switch"))
+            .await,
+        "second send",
+    );
+    unread_at_least(&mut bob_snapshots, &room_id, 2).await;
+    checked(
+        rules
+            .change(RuleChange::Room(
+                room.room_id().to_string(),
+                RoomMode::Default,
+            ))
+            .await,
+        "reset room override",
+    );
+    reopened.abort();
+    notifications.abort();
+    alice_sync.abort();
+    eprintln!("PASS: inactive account unread counts, notification and reopen on the same client");
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Synapse fixture"]
+async fn activity_previews_and_mark_all_read() {
+    // The notifications popover's data (#99): latest-message previews for
+    // listed rooms, and marking them read up to their latest event.
+    use crate::activity::PreviewBody;
+    use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-data/local/integration");
+    let fixture: Fixture = checked(
+        serde_json::from_slice(&checked(
+            tokio::fs::read(root.join("fixture.json")).await,
+            "fixture",
+        )),
+        "parse fixture",
+    );
+    assert!(fixture.homeserver == "https://127.0.0.1:18448");
+    let cert = checked(
+        Certificate::from_pem(&checked(tokio::fs::read(root.join("ca.crt")).await, "CA")),
+        "parse CA",
+    );
+    let run = root.join(format!("activity-{}", Uuid::new_v4()));
+    let mut accounts = Vec::new();
+    for (name, password) in [("alice", &fixture.alice), ("bob", &fixture.bob)] {
+        let client = test_client(&run, name, &Uuid::new_v4().to_string(), &cert).await;
+        checked(
+            client.matrix_auth().login_username(name, password).await,
+            "isolated login",
+        );
+        accounts.push(Account::new(
+            client,
+            run.join(name),
+            secrets::SessionStore::new("twayblade.integration.unused"),
+            Arc::new(Mutex::new(())),
+        ));
+    }
+    let alice = accounts[0].clone();
+    let bob = accounts[1].clone();
+    let alice_sync = sync(&alice);
+    let bob_sync = sync(&bob);
+    let mut request = create_room::v3::Request::new();
+    request.name = Some("Activity room".into());
+    request.invite = vec![bob.client.user_id().expect("test user").to_owned()];
+    let room = checked(alice.client.create_room(request).await, "room");
+    checked(bob.client.join_room_by_id(room.room_id()).await, "join");
+    wait_for_room(&bob, room.room_id()).await;
+    wait_for_room(&alice, room.room_id()).await;
+    let body = format!("activity preview {}", Uuid::new_v4());
+    checked(
+        room.send(RoomMessageEventContent::text_plain(format!(
+            "{body}\nsecond line"
+        )))
+        .await,
+        "send",
+    );
+    let id = room.room_id().to_string();
+    let preview = checked(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let previews = bob.room_previews(std::slice::from_ref(&id)).await;
+                if let Some(preview) = previews
+                    .into_iter()
+                    .find(|preview| preview.body == PreviewBody::Text(body.clone()))
+                {
+                    break preview;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await,
+        "latest message preview",
+    );
+    assert!(preview.sender == alice.user_id() && !preview.own && preview.room == id);
+    let bob_room = bob.client.get_room(room.room_id()).expect("bob's room");
+    checked(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while bob_room.num_unread_messages() == 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await,
+        "unread before marking",
+    );
+    checked(
+        bob.mark_rooms_read(std::slice::from_ref(&id)).await,
+        "mark read",
+    );
+    checked(
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while bob_room.num_unread_messages() > 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+        .await,
+        "unread cleared",
+    );
+    assert!(
+        bob.mark_rooms_read(&["!missing:127.0.0.1".into()])
+            .await
+            .is_err(),
+        "an unknown room is reported"
+    );
+    alice_sync.abort();
+    bob_sync.abort();
+    eprintln!("PASS: latest-message preview and mark all read");
 }
 
 #[tokio::test]
