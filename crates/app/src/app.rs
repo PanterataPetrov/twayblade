@@ -806,16 +806,76 @@ impl MatrixApp {
                         // Deliver anything published since `snapshot()`; stale revisions are ignored.
                         updates.mark_changed();
                         cx.spawn_in(window, async move |view, cx| {
-                            // Wakes only on a published change; ends with the view or backend.
-                            while updates.changed().await.is_ok() {
-                                let snapshot = updates.borrow_and_update().clone();
-                                if view
-                                    .update_in(cx, |this, window, cx| {
-                                        this.apply(snapshot, window, cx)
+                            // Wakes only on a published change. This loop is the only way the
+                            // window learns anything, so it must not end on a one-off failure:
+                            // a single failed update (for instance while the window changes
+                            // state) used to end it for good, leaving the UI frozen on its last
+                            // snapshot while the backend kept working. It now ends only with the
+                            // view or the backend, and retries the latest snapshot otherwise.
+                            let mut failures = 0u32;
+                            'wake: while updates.changed().await.is_ok() {
+                                loop {
+                                    let snapshot = updates.borrow_and_update().clone();
+                                    if view
+                                        .update_in(cx, |this, window, cx| {
+                                            this.apply(snapshot, window, cx)
+                                        })
+                                        .is_ok()
+                                    {
+                                        failures = 0;
+                                        continue 'wake;
+                                    }
+                                    if view.upgrade().is_none() {
+                                        tracing::info!(name: "ui_updates_loop_end_view_gone", failures);
+                                        return;
+                                    }
+                                    failures = failures.saturating_add(1);
+                                    // About ten seconds of trying, then stop rather than spin.
+                                    if failures > 200 {
+                                        tracing::warn!(name: "ui_updates_loop_end_gave_up", failures);
+                                        return;
+                                    }
+                                    tracing::warn!(name: "ui_snapshot_apply_retry", failures);
+                                    cx.background_executor()
+                                        .timer(std::time::Duration::from_millis(50))
+                                        .await;
+                                }
+                            }
+                            tracing::warn!(name: "ui_updates_loop_end_backend_closed", failures);
+                        })
+                        .detach();
+                        // Safety net: if the backend has published something this
+                        // window has not applied for a while (a dead loop, a missed
+                        // wake-up), apply the latest directly instead of staying frozen.
+                        let watched = backend.clone();
+                        cx.spawn_in(window, async move |view, cx| {
+                            loop {
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_secs(1))
+                                    .await;
+                                let behind = view
+                                    .update_in(cx, |this, _, _| {
+                                        watched.revision() > this.snapshot.revision
                                     })
-                                    .is_err()
-                                {
-                                    break;
+                                    .ok();
+                                match behind {
+                                    None => return,
+                                    Some(false) => continue,
+                                    Some(true) => {}
+                                }
+                                // Give the normal path a moment before stepping in.
+                                cx.background_executor()
+                                    .timer(std::time::Duration::from_millis(500))
+                                    .await;
+                                let latest = watched.snapshot();
+                                let pulled = view.update_in(cx, |this, window, cx| {
+                                    if latest.revision > this.snapshot.revision {
+                                        tracing::warn!(name: "ui_snapshot_pulled", revision = latest.revision);
+                                        this.apply(latest, window, cx);
+                                    }
+                                });
+                                if pulled.is_err() && view.upgrade().is_none() {
+                                    return;
                                 }
                             }
                         })
