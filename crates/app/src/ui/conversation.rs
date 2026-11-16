@@ -57,9 +57,7 @@ impl MatrixApp {
         let editable = !self.busy && (self.preview || self.snapshot.timeline_ready);
         let empty = self.composer.read(cx).value().trim().is_empty();
         let editing = self.edit_session.as_ref().is_some_and(|s| !s.in_thread);
-        let stacked = !self.attachment_drafts.is_empty()
-            || self.attachment_pending > 0
-            || (self.preview && self.attachment_sample);
+        let stacked = !self.attachments.is_empty() || (self.preview && self.attachment_sample);
         let details_shown = self.details_open || self.profile.is_some() || self.thread.is_some();
 
         let room_icon = if room.direct || room.avatar.is_some() {
@@ -309,8 +307,9 @@ impl MatrixApp {
                     .border_1()
                     .border_color(cx.theme().input)
                     .bg(palette.field)
-                    .when(stacked, |view| view.child(self.attachment_tray(cx)))
+                    .when(stacked, |view| view.child(self.attachment_tray(false, cx)))
                     .children(self.edit_bar(false, cx))
+                    .children(self.reply_bar(cx))
                     .child(
                         self.composer_keys(div().id("composer-panel"), false, cx)
                             // The text field binds ↑/↓ itself; take them first only when they
@@ -325,6 +324,9 @@ impl MatrixApp {
                                         .is_some_and(|session| !session.in_thread)
                                     {
                                         this.end_edit(window, cx);
+                                        cx.stop_propagation();
+                                    } else if this.open_reply().is_some() {
+                                        this.cancel_reply(cx);
                                         cx.stop_propagation();
                                     }
                                 },
@@ -366,7 +368,7 @@ impl MatrixApp {
                                     .on_paste(move |clipboard, window, cx| {
                                         paste_target
                                             .update(cx, |this, cx| {
-                                                this.paste_attachment(clipboard, window, cx)
+                                                this.paste_attachment(false, clipboard, window, cx)
                                             })
                                             .unwrap_or(false)
                                     }),
@@ -385,15 +387,9 @@ impl MatrixApp {
                                     .icon(IconName::Paperclip)
                                     .accessibility_label("Attach file")
                                     .tooltip("Attach File…")
-                                    .disabled(
-                                        !editable
-                                            || self.preview
-                                            || self.attachment_drafts.len()
-                                                + self.attachment_pending
-                                                >= crate::ui::attachments::MAX_ATTACHMENTS,
-                                    )
+                                    .disabled(!editable || self.preview || self.attachments.full())
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.choose_attachment(window, cx)
+                                        this.choose_attachment(false, window, cx)
                                     })),
                             )
                             .child(
@@ -424,8 +420,8 @@ impl MatrixApp {
                                     .tooltip(if editing { "Save  ↩" } else { "Send  ↩" })
                                     .disabled(
                                         !ready
-                                            || (empty && self.attachment_drafts.is_empty())
-                                            || self.attachment_pending > 0
+                                            || (empty && self.attachments.drafts.is_empty())
+                                            || self.attachments.pending > 0
                                             || self.sending.contains(&room.id),
                                     )
                                     .on_click(
@@ -440,6 +436,8 @@ impl MatrixApp {
                     .pl(px(4.))
                     .text_size(px(11.))
                     .text_color(muted)
+                    // Nobody typing: who has read up to the latest message.
+                    .when(typing.is_empty(), |line| line.children(self.seen_by_row()))
                     .when(!typing.is_empty(), |line| {
                         // Who is typing (avatars), a pulse, then the accessible text.
                         let reduce = self.snapshot.reduce_motion;
@@ -491,9 +489,55 @@ impl MatrixApp {
             .child(body)
             .child(composer)
             .on_drop::<ExternalPaths>(cx.listener(|this, paths: &ExternalPaths, window, cx| {
-                this.add_attachments(paths.0.iter().cloned(), window, cx);
+                this.add_attachments(false, paths.0.iter().cloned(), window, cx);
             }))
             .into_any_element()
+    }
+
+    /// The people whose read receipt is on the latest message, in groups and
+    /// direct messages alike. None until someone besides you has read it.
+    fn seen_by_row(&self) -> Option<AnyElement> {
+        if !self.snapshot.timeline_ready {
+            return None;
+        }
+        let latest = self
+            .snapshot
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.event_id.is_some())?;
+        let names: Vec<String> = latest
+            .read_by
+            .iter()
+            .map(|user| {
+                self.snapshot
+                    .members
+                    .iter()
+                    .find(|member| &member.user_id == user)
+                    .map(|member| member.display_name.clone())
+                    .filter(|name| !name.is_empty())
+                    // Before the member list loads: the user's local part.
+                    .unwrap_or_else(|| {
+                        user.trim_start_matches('@')
+                            .split(':')
+                            .next()
+                            .unwrap_or(user)
+                            .to_owned()
+                    })
+            })
+            .collect();
+        let text = model::seen_by_line(&names)?;
+        Some(
+            h_flex()
+                .id("seen-by")
+                .gap(px(6.))
+                .items_center()
+                .min_w_0()
+                .child(Icon::new(IconName::CheckCheck).size(px(12.)))
+                .child(div().min_w_0().truncate().child(text))
+                .test_support()
+                .into_any_element(),
+        )
     }
 
     /// A slim strip under the header while there is no connection. The messages

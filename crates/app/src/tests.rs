@@ -774,7 +774,7 @@ fn attachment_controls_require_an_explicit_action_and_samples_cannot_upload(
         window.click(gpui_kit::SharedString::from(format!("open-{id}")), cx);
     })
     .expect("attachment controls");
-    cx.update(|cx| assert!(app.read(cx).attachment_drafts.is_empty()));
+    cx.update(|cx| assert!(app.read(cx).attachments.drafts.is_empty()));
     cx.update(|cx| {
         app.update(cx, |app, cx| {
             let message = app.snapshot.messages.last_mut().unwrap();
@@ -2347,6 +2347,108 @@ fn the_message_menu_offers_actions_and_asks_before_deleting(cx: &mut TestAppCont
         let app = app.read(cx);
         assert!(app.edit_session.as_ref().is_some_and(|s| s.confirm_delete));
         assert_eq!(app.composer.read(cx).value().to_string(), "");
+    });
+}
+
+#[gpui_kit::test]
+fn reply_names_the_message_and_can_be_cancelled(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    let id = cx.update(|cx| {
+        app.read(cx)
+            .snapshot
+            .messages
+            .iter()
+            .find(|m| m.event_id.is_some() && m.sender != app.read(cx).snapshot.user_id)
+            .map(|m| m.id.clone())
+            .expect("someone else's message")
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click(gpui_kit::SharedString::from(format!("reply-to-{id}")), cx);
+        window.render_frame(cx);
+        assert!(window.find("reply-bar").visible(), "reply bar shown");
+    })
+    .expect("reply");
+    cx.update(|cx| {
+        let reply = app.read(cx).reply_to.as_ref().expect("replying");
+        assert!(!reply.event_id.is_empty());
+        assert!(!reply.sender.is_empty());
+    });
+    cx.update_window(window, |_, window, cx| {
+        window.click("reply-cancel", cx);
+        window.render_frame(cx);
+        assert!(window.find_all("reply-bar").is_empty(), "reply cancelled");
+    })
+    .expect("cancel");
+}
+
+#[gpui_kit::test]
+fn the_composer_shows_who_has_seen_the_latest_message(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    let seen = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            !window.find_all("seen-by").is_empty()
+        })
+        .expect("render")
+    };
+    cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            app.snapshot.typing.clear();
+            let reader = app.snapshot.members[0].user_id.clone();
+            let latest = app
+                .snapshot
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.event_id.is_some())
+                .expect("a sent message");
+            latest.read_by = vec![reader];
+            cx.notify();
+        })
+    });
+    assert!(seen(cx), "a reader of the latest message is shown");
+    // Someone typing takes the line instead.
+    cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            app.snapshot.typing = app
+                .snapshot
+                .members
+                .iter()
+                .take(1)
+                .map(|m| twayblade_core::room_state::TypingUser {
+                    user_id: m.user_id.clone(),
+                    name: m.display_name.clone(),
+                    avatar: None,
+                })
+                .collect();
+            cx.notify();
+        })
+    });
+    assert!(!seen(cx), "typing replaces the read line");
+}
+
+#[gpui_kit::test]
+fn a_thread_reply_has_its_own_attachments(cx: &mut TestAppContext) {
+    let (window, app) = preview_window(cx);
+    cx.update_window(window, |_, window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_thread("sample-0".into(), window, cx);
+            // A file still being added to the thread's reply.
+            app.thread.as_mut().unwrap().attachments.pending = 1;
+            cx.notify();
+        });
+        window.render_frame(cx);
+        assert!(window.find("thread-attach-file").visible());
+        assert!(window.find("thread-attachment-pending-0").visible());
+        // The main composer stays empty: the file belongs to the thread.
+        assert!(window.find_all("attachment-pending-0").is_empty());
+    })
+    .expect("thread attachments");
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(app.attachments.is_empty());
+        assert!(!app.attachments(true).unwrap().is_empty());
     });
 }
 
