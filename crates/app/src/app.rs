@@ -436,6 +436,8 @@ pub(super) struct MatrixApp {
     selection_task: Option<Task<()>>,
     /// The message being edited in a composer, if any.
     pub edit_session: Option<crate::ui::editing::EditSession>,
+    /// The message the main composer's next send replies to.
+    pub reply_to: Option<crate::ui::replying::ReplyDraft>,
     /// A draft to put back into a composer once a window is available.
     pub edit_restore: Option<(Entity<gpui_kit::component::input::TextareaState>, String)>,
     /// Image message IDs rendered this frame: [main timeline, open thread].
@@ -821,6 +823,7 @@ impl MatrixApp {
             _subscriptions: subscriptions,
             selection_task: None,
             edit_session: None,
+            reply_to: None,
             edit_restore: None,
             visible_images: Default::default(),
             visible_flush: Default::default(),
@@ -1823,6 +1826,11 @@ impl MatrixApp {
         let instance = self.snapshot.account_instance;
         let sent_body = has_text.then(|| body.clone());
         let sent_room = room.clone();
+        // A reply goes with the text; attachments alone are not replies.
+        let reply = has_text
+            .then(|| self.open_reply().map(|reply| reply.event_id.clone()))
+            .flatten();
+        let sent_reply = reply.clone();
         let staged = std::mem::take(&mut self.attachments.drafts);
         let attachment_request = self.attachments.request;
         self.job(
@@ -1839,7 +1847,7 @@ impl MatrixApp {
                     }
                 }
                 let result = match sent_body {
-                    Some(text) => backend.send_text(sent_room, text),
+                    Some(text) => backend.send_text(sent_room, text, sent_reply),
                     None => Ok(()),
                 };
                 (result, Vec::new())
@@ -1861,6 +1869,11 @@ impl MatrixApp {
                 match result {
                     Ok(()) if !has_text => {}
                     Ok(()) => {
+                        if reply.is_some()
+                            && this.reply_to.as_ref().map(|r| &r.event_id) == reply.as_ref()
+                        {
+                            this.reply_to = None;
+                        }
                         if let Some((state, _)) = this.composers.get(&room)
                             && state.read(cx).value().as_str() == body
                         {
