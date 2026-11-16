@@ -55,3 +55,11 @@ no live Matrix or Element checks were performed. Voice-channel first join,
 rejoin, member removal and real audio/E2EE interoperability remain unverified.
 No physical macOS UI, keyboard/VoiceOver, media permissions or Linux/Windows
 runtime acceptance is claimed. No remote publication or merge was performed.
+
+## Develop integration
+
+At the user's request, integrated `upstream/develop` at `b41dff7` before
+publication. Retained its navigation-history restoration and dialog behavior,
+applied channel routing to the shared history visibility helper, and kept the
+compact title bar. Formatting, strict workspace/all-target Clippy and the full
+workspace tests passed again (226 passed, 39 ignored).
