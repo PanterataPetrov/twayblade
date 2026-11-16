@@ -174,6 +174,8 @@ pub enum TimelineStatus {
 pub enum ConversationError {
     #[error("empty_message")]
     EmptyMessage,
+    #[error("voice_channel_has_no_messages")]
+    VoiceOnly,
     #[error("queue_failed")]
     Queue,
     #[error(transparent)]
@@ -217,6 +219,7 @@ pub struct ConversationSnapshot {
 
 impl Conversation {
     pub async fn send(&self, body: String) -> Result<(), ConversationError> {
+        self.ensure_text_channel()?;
         if body.trim().is_empty() {
             return Err(ConversationError::EmptyMessage);
         }
@@ -227,6 +230,16 @@ impl Conversation {
             .map_err(|_| ConversationError::Queue)
     }
 
+    pub(crate) fn ensure_text_channel(&self) -> Result<(), ConversationError> {
+        if crate::channels::ChannelKind::of(self.timeline.room())
+            == crate::channels::ChannelKind::Voice
+        {
+            Err(ConversationError::VoiceOnly)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Sends `body` as a reply quoting `in_reply_to`. The SDK adds the reply
     /// relation, the quoted sender's mention and, in a thread, the thread.
     pub async fn send_reply(
@@ -234,6 +247,7 @@ impl Conversation {
         body: String,
         in_reply_to: &str,
     ) -> Result<(), ConversationError> {
+        self.ensure_text_channel()?;
         if body.trim().is_empty() {
             return Err(ConversationError::EmptyMessage);
         }
@@ -304,6 +318,7 @@ impl Conversation {
     }
 
     pub async fn toggle_reaction(&self, id: &str, key: &str) -> Result<(), ConversationError> {
+        self.ensure_text_channel()?;
         let items = self.timeline.items().await;
         let event = items
             .iter()
@@ -339,6 +354,7 @@ impl Conversation {
     }
 
     pub async fn retry(&self, id: &str) -> Result<(), ConversationError> {
+        self.ensure_text_channel()?;
         self.failed_handle(id)
             .await?
             .unwedge()

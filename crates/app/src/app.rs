@@ -94,6 +94,11 @@ impl MatrixApp {
         );
     }
 
+    pub(crate) fn is_voice_channel(&self, room: &str) -> bool {
+        self.snapshot.rooms.iter().any(|entry| {
+            entry.id == room && entry.channel_kind == twayblade_core::channels::ChannelKind::Voice
+        })
+    }
     pub fn start_call(
         &self,
         room_id: String,
@@ -1621,6 +1626,7 @@ impl MatrixApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.navigation.route_room(&id, &self.snapshot);
         self.management = None;
         // Choosing a room supersedes reopening the account's last one.
         self.restore_room = None;
@@ -2040,7 +2046,6 @@ impl MatrixApp {
                 match result {
                     Ok(true) => {
                         this.pagination_exhausted = true;
-                        this.status = "Beginning of conversation".into();
                     }
                     Ok(false) => {}
                     Err(error) => this.status = error.to_string(),
@@ -2471,6 +2476,7 @@ impl MatrixApp {
                 match result {
                     Ok(crate::backend::SpaceOutcome::Room(id)) => {
                         this.close_profile(cx);
+                        this.navigation.selected_space = None;
                         this.select_room(id, window, cx);
                     }
                     Ok(_) => {}
