@@ -2245,6 +2245,109 @@ fn editing_loads_your_message_and_always_restores_the_draft(cx: &mut TestAppCont
     })
     .expect("editing flow");
     cx.update(|cx| assert!(app.read(cx).edit_session.is_none()));
+
+    // Emptying the message and pressing Return asks before deleting it.
+    // Composer events reach the app after each window update, so every key
+    // press gets its own update.
+    let empty_and_return = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            app.update(cx, |app, cx| {
+                app.composer
+                    .update(cx, |state, cx| state.set_value("", window, cx))
+            });
+            window.within("composer-panel").click("input-state", cx);
+            window.key_down("enter", false, cx);
+        })
+        .expect("return");
+        cx.run_until_parked();
+    };
+    let asking = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            !window.find_all("edit-delete").is_empty()
+        })
+        .expect("render")
+    };
+    cx.update_window(window, |_, window, cx| {
+        window.click(gpui_kit::SharedString::from(format!("edit-{}", ids[1])), cx);
+        window.render_frame(cx);
+    })
+    .expect("edit");
+    empty_and_return(cx);
+    assert!(asking(cx), "asks before deleting");
+    // Typing again keeps editing instead.
+    cx.update_window(window, |_, window, cx| window.input("x", cx))
+        .expect("type");
+    cx.run_until_parked();
+    assert!(!asking(cx), "typing withdraws the question");
+    empty_and_return(cx);
+    assert!(asking(cx));
+    cx.update(|cx| assert!(app.read(cx).edit_session.is_some()));
+    // A second Return deletes: in the preview that ends the edit.
+    cx.update_window(window, |_, window, cx| window.key_down("enter", false, cx))
+        .expect("delete");
+    cx.run_until_parked();
+    cx.update(|cx| assert!(app.read(cx).edit_session.is_none()));
+}
+
+#[gpui_kit::test]
+fn the_message_menu_offers_actions_and_asks_before_deleting(cx: &mut TestAppContext) {
+    use gpui_kit::test::{TestEventExt, TestQueryExt};
+    let (window, app) = preview_window(cx);
+    let id = cx.update(|cx| {
+        app.update(cx, |app, cx| {
+            let user = app.snapshot.user_id.clone();
+            let message = app
+                .snapshot
+                .messages
+                .iter_mut()
+                .find(|m| m.kind == crate::backend::MessageKind::Text && m.attachment.is_none())
+                .expect("a text message");
+            message.sender = user;
+            message.body = "menu target".into();
+            message.editable = true;
+            message.event_id = Some("$menu-target".into());
+            let id = message.id.clone();
+            cx.notify();
+            id
+        })
+    });
+    let open_menu = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, window, cx| {
+            window.render_frame(cx);
+            window.right_click(
+                gpui_kit::SharedString::from(format!("message-row-{id}")),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .expect("right click");
+        cx.run_until_parked();
+    };
+    open_menu(cx);
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        for label in ["Add Reaction…", "Copy Text", "Copy Link", "Edit", "Delete…"] {
+            assert!(window.find_by_label(label).visible(), "missing {label}");
+        }
+        let point = window.find_by_label("Delete…").bounds().center();
+        window.pointer_move(point, None, cx);
+        window.pointer_down(point, gpui_kit::MouseButton::Left, cx);
+        window.pointer_up(point, gpui_kit::MouseButton::Left, cx);
+    })
+    .expect("choose delete");
+    cx.run_until_parked();
+    // Delete… asks first, exactly as an emptied edit does.
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.find("edit-delete").visible(), "asks before deleting");
+    })
+    .expect("delete question");
+    cx.update(|cx| {
+        let app = app.read(cx);
+        assert!(app.edit_session.as_ref().is_some_and(|s| s.confirm_delete));
+        assert_eq!(app.composer.read(cx).value().to_string(), "");
+    });
 }
 
 #[gpui_kit::test]
@@ -3176,6 +3279,35 @@ fn opening_the_archive_scrolls_a_long_sidebar_to_it(cx: &mut TestAppContext) {
         );
     })
     .expect("archive scroll");
+}
+
+#[gpui_kit::test]
+fn the_thread_panel_fits_its_region(cx: &mut TestAppContext) {
+    // Narrow enough that the region's 32% cap is below the panel's 360 px.
+    let (window, app) = preview_window_sized(cx, size(px(1000.), px(760.)));
+    cx.update_window(window, |_, window, cx| {
+        app.update(cx, |app, cx| app.open_thread("sample-0".into(), window, cx));
+        window.render_frame(cx);
+        let panel = window.find("close-thread").bounds();
+        let region = window.find("panel-thread-region").bounds();
+        // The region holds the panel at the width it allows (32% of the
+        // window here), not a fraction of it and not more.
+        assert!(
+            region.size.width > px(300.),
+            "thread panel squeezed: {region:?}"
+        );
+        assert!(
+            panel.right() <= region.right(),
+            "close button cut off: {panel:?} past {region:?}"
+        );
+        // The close button sits at the panel's trailing edge, so it ends
+        // near the region's: a squeezed panel leaves it far from there.
+        assert!(
+            region.right() - panel.right() < px(40.),
+            "panel narrower than its region: close at {panel:?}, region {region:?}"
+        );
+    })
+    .expect("thread panel");
 }
 
 #[gpui_kit::test]

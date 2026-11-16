@@ -122,11 +122,29 @@ impl MatrixApp {
                                     gpui_kit::component::tooltip::Tooltip::new(url.clone())
                                         .build(window, cx)
                                 })
-                                .on_link_click(|url, _, _, cx| {
-                                    if url::Url::parse(url).is_ok_and(|url| {
-                                        matches!(url.scheme(), "https" | "http" | "mailto")
-                                    }) {
-                                        cx.open_url(url);
+                                .on_link_click({
+                                    let weak = cx.weak_entity();
+                                    move |url, _, window, cx| {
+                                        // A mention opens the person's profile beside the chat.
+                                        if let Some(user) = model::mentioned_user(url) {
+                                            let _ = weak.update(cx, |this, cx| {
+                                                let name = this
+                                                    .snapshot
+                                                    .members
+                                                    .iter()
+                                                    .find(|member| member.user_id == user)
+                                                    .map(|member| member.display_name.clone())
+                                                    .filter(|name| !name.is_empty())
+                                                    .unwrap_or_else(|| user.clone());
+                                                this.open_profile(user, name, window, cx);
+                                            });
+                                            return;
+                                        }
+                                        if url::Url::parse(url).is_ok_and(|url| {
+                                            matches!(url.scheme(), "https" | "http" | "mailto")
+                                        }) {
+                                            cx.open_url(url);
+                                        }
                                     }
                                 })
                                 .when(
@@ -662,7 +680,96 @@ impl MatrixApp {
         if let Some(canvas) = self.latest_visibility(message, in_thread, cx) {
             row = row.relative().child(canvas);
         }
-        row.test_support().into_any_element()
+        div()
+            .id(SharedString::from(format!(
+                "message-context-{}",
+                message.id
+            )))
+            .w_full()
+            .child(row.test_support())
+            .context_menu(self.message_menu(message, in_thread, cx))
+            .into_any_element()
+    }
+
+    /// Right-click actions for one message: the hover bar's actions plus
+    /// copying, in the order Messages and Slack use.
+    fn message_menu(
+        &self,
+        message: &crate::backend::Message,
+        in_thread: bool,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(
+        gpui_kit::component::menu::PopupMenu,
+        &mut Window,
+        &mut Context<gpui_kit::component::menu::PopupMenu>,
+    ) -> gpui_kit::component::menu::PopupMenu
+    + 'static {
+        let weak = cx.weak_entity();
+        let id = message.id.clone();
+        let event_id = message.event_id.clone();
+        let editable = message.editable;
+        let readable = !message.body.is_empty()
+            && matches!(
+                message.kind,
+                MessageKind::Text | MessageKind::Emote | MessageKind::Notice
+            );
+        let body = message.body.clone();
+        let link = event_id
+            .as_ref()
+            .zip(self.navigation.selected_room.as_ref())
+            .map(|(event, room)| format!("https://matrix.to/#/{room}/{event}"));
+        let can_react = event_id.is_some() || self.preview;
+        move |mut menu, _, _| {
+            if can_react {
+                let (weak, id) = (weak.clone(), id.clone());
+                menu = menu.item(PopupMenuItem::new("Add Reaction…").on_click(
+                    move |_, window, cx| {
+                        let _ = weak
+                            .update(cx, |this, cx| this.open_emoji(Some(id.clone()), window, cx));
+                    },
+                ));
+            }
+            if !in_thread && event_id.is_some() {
+                let (weak, id) = (weak.clone(), id.clone());
+                menu = menu.item(PopupMenuItem::new("Reply in Thread").on_click(
+                    move |_, window, cx| {
+                        let _ =
+                            weak.update(cx, |this, cx| this.open_thread(id.clone(), window, cx));
+                    },
+                ));
+            }
+            menu = menu.separator();
+            if readable {
+                let body = body.clone();
+                menu = menu.item(PopupMenuItem::new("Copy Text").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(body.clone()))
+                }));
+            }
+            if let Some(link) = link.clone() {
+                menu = menu.item(PopupMenuItem::new("Copy Link").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(link.clone()))
+                }));
+            }
+            if editable && let Some(event_id) = event_id.clone() {
+                let (edit_view, edit_event) = (weak.clone(), event_id.clone());
+                let (delete_view, delete_event) = (weak.clone(), event_id);
+                menu = menu
+                    .separator()
+                    .item(PopupMenuItem::new("Edit").on_click(move |_, window, cx| {
+                        let _ = edit_view.update(cx, |this, cx| {
+                            this.start_edit(edit_event.clone(), in_thread, window, cx)
+                        });
+                    }))
+                    .item(
+                        PopupMenuItem::new("Delete…").on_click(move |_, window, cx| {
+                            let _ = delete_view.update(cx, |this, cx| {
+                                this.request_delete(delete_event.clone(), in_thread, window, cx)
+                            });
+                        }),
+                    );
+            }
+            menu
+        }
     }
 
     /// For the latest event: a full-size canvas that reports whether it is on
@@ -744,6 +851,10 @@ impl MatrixApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let text = membership_text(message, &self.snapshot.user_id);
+        // Minimal and IRC drop the centred pause markers (their rows carry a
+        // time), so a membership line shows its own time in passing.
+        let time = (self.preferences.chat.style != ChatStyle::Bubbles)
+            .then(|| time_label(message.timestamp_ms));
         h_flex()
             .id(SharedString::from(format!("message-row-{}", message.id)))
             .role(Role::Group)
@@ -751,11 +862,12 @@ impl MatrixApp {
             .relative()
             .w_full()
             .pl(px(self.membership_indent()))
-            .py(px(2.))
+            .py(px(1.))
             .gap(px(6.))
             .text_size(px(11.5))
             .text_color(cx.theme().muted_foreground)
             .child(div().truncate().child(text))
+            .children(time.map(|time| div().flex_none().text_size(px(10.5)).child(time)))
             .children(self.latest_visibility(message, in_thread, cx))
             .test_support()
             .into_any_element()
@@ -801,9 +913,10 @@ impl MatrixApp {
         let new_day = previous
             .is_none_or(|previous| day_of(previous.timestamp_ms) != day_of(first.timestamp_ms));
         // Messages-style time markers: one centred label for a new day or after a
-        // long silence, instead of a timestamp row above every group.
+        // long silence, instead of a timestamp row above every group. Only
+        // Bubbles needs the pause marker: Minimal and IRC rows show their time.
         let day_marker = new_day.then(|| day_label(first.timestamp_ms));
-        let marker = if new_day {
+        let marker = if new_day || self.preferences.chat.style != ChatStyle::Bubbles {
             None
         } else {
             previous
